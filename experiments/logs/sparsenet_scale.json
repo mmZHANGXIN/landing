@@ -1,0 +1,21 @@
+{
+  "source": "target_depth_m=0.800",
+  "encoding": "inverse_unit",
+  "dmax": 30.0,
+  "pixels_used": 2428,
+  "valid_ratio": 0.148193359375,
+  "suggested_output_scale": 42.6262092590332,
+  "ratio_p10": 41.128074645996094,
+  "ratio_p50": 42.6262092590332,
+  "ratio_p90": 48.39058837890627,
+  "raw_error": {
+    "median_abs_m": 28.514976501464844,
+    "mean_abs_m": 28.536420822143555,
+    "p90_abs_m": 28.59657726287842
+  },
+  "scaled_error": {
+    "median_abs_m": 0.6954458355903625,
+    "mean_abs_m": 1.515291690826416,
+    "p90_abs_m": 3.4783266067504996
+  }
+}

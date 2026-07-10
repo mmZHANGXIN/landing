@@ -1,0 +1,33 @@
+{
+  "source_model": "C:\\data_eve\\FaultyYawLanding\\DeepRL\\data\\trained_policy\\last_step_model.zip",
+  "input_name": "input/Ob",
+  "output_name": "model/pi/add:0",
+  "onnx_input_name": "input/Ob:0",
+  "onnx_input_shape": [
+    -1,
+    128,
+    128,
+    2
+  ],
+  "onnx_output_name": "model/pi/add:0",
+  "onnx_output_shape": [
+    -1,
+    10
+  ],
+  "observation_space_shape": [
+    128,
+    128,
+    2
+  ],
+  "observation_space_low": 0.0,
+  "observation_space_high": 255.0,
+  "action_space_n": 10,
+  "opset_version": 11,
+  "normalization": "obs/255  (VecNormalize scale=True on Box(0,255))",
+  "export_notes": [
+    "PPO2 CNN policy inference subgraph only",
+    "Input: (N, H, W, C) float32, range [0, 1]",
+    "Output: (N, 10) float32 action logits",
+    "Use argmax(logits) to get discrete action 0-9"
+  ]
+}

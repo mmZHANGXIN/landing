@@ -1,0 +1,10 @@
+# 模型权重存放目录
+# 将训练好的 SB3 PPO 权重 (.zip) 放在此目录
+# 
+# 示例:
+#   weights/last_step_model_sb3.zip
+#
+# 从原 SB2 权重转换:
+#   python -m stable_baselines3.common.convert_from_tensorflow \
+#       --input last_step_model.zip \
+#       --output weights/last_step_model_sb3.zip
