@@ -1,0 +1,21 @@
+# 室内正式实验：FAST-LIO external vision 注入 PX4 EKF。
+# 完整运行快照会在启动时展开并保存，不依赖此 extends 文件离线复现。
+extends: "experiment_config.yaml"
+
+localization:
+  mode: "fastlio_external_vision"
+  px4_position_source: "external_vision"
+  allow_gps_fallback: false
+
+mission_state:
+  boundary_enable: true
+  boundary_x_min: -1.5
+  boundary_x_max: 1.5
+  boundary_y_min: -1.5
+  boundary_y_max: 1.5
+  boundary_trigger_action: "direct_land"
+
+global_prior:
+  enabled: true
+  mode: "local_body_offset"
+  local_body_offset_m: [0.0, 0.0, 1.5]

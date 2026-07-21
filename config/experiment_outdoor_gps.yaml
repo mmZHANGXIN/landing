@@ -1,0 +1,38 @@
+# 室外正式实验：GPS/PX4 EKF 控制定位，FAST-LIO 仅用于感知。
+# 完整运行快照会在启动时展开并保存，不依赖此 extends 文件离线复现。
+extends: "experiment_config.yaml"
+
+localization:
+  mode: "gps_px4_fastlio_perception"
+  px4_position_source: "gps"
+  allow_gps_fallback: false
+  use_body_cloud: true
+  body_cloud_topic: "/cloud_registered_body"
+
+mission_state:
+  boundary_enable: false
+  height_source: "px4_enu_z"
+  height_axis: "pos_z"
+
+# Outdoor control is PX4 EKF/GPS-authoritative. FAST-LIO odometry may drift in
+# low-feature grass fields and is recorded for diagnostics only; the body-cloud
+# freshness/point-count/PX4 timestamp gates remain active in the flight loop.
+fastlio_health:
+  require_static_initialization: false
+
+# Bound outdoor HALSS work independently of altitude: one nearest observed
+# point per 64x64 training-camera ray (at most 4096 points).
+perception:
+  halss_pinhole_ray_sampling_enabled: true
+  halss_pinhole_ray_grid_res: 64
+
+global_prior:
+  enabled: true
+  mode: "gps"
+  goto_max_vertical_speed_mps: 1.0
+  # 本次 GIS 九宫格最低风险格中心；更换场地后必须在这里更新。
+  target_lat: 22.729503968041545
+  target_lon: 113.90750832702452
+  target_altitude_m: 30.0
+  target_source: "gis"
+  goto_timeout_action: "hold_for_manual"

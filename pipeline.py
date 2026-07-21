@@ -10,8 +10,8 @@ Orin Landing - 真机实时感知-决策-控制主管线
   点云 → 原训练下视相机几何稀疏深度 → NN-fill 渲染深度
   [rendered_depth, binary_semantic] → ONNX PPO → 离散动作
   离散动作 + 同帧 Fast-LIO yaw → NED 速度 + yaw setpoint → PX4
-python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros
-  """
+  python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros
+"""
 
 from __future__ import annotations
 
