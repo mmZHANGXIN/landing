@@ -4,13 +4,14 @@ Orin Landing - 真机实时感知-决策-控制主管线
 ==========================================
 
 链路:
-  GIS 九宫格全局安全区 → MAVSDK 位置引导
+  GIS 九宫格全局安全区 → MAVROS/PX4 位置引导
   Mid360 → FAST-LIO 去畸变点云/位姿
   点云 → HALSS Bayesian 二值安全语义图
-  点云 → HALSS 对齐 BEV 稀疏深度 → NN-fill 渲染深度
+  点云 → 原训练下视相机几何稀疏深度 → NN-fill 渲染深度
   [rendered_depth, binary_semantic] → ONNX PPO → 离散动作
   离散动作 + 同帧 Fast-LIO yaw → NED 速度 + yaw setpoint → PX4
-"""
+python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros
+  """
 
 from __future__ import annotations
 
@@ -40,9 +41,12 @@ _RUNTIME_DEPS_READY = False
 def _import_runtime_deps():
     """Import CUDA/ROS/model dependencies only after strict config gates pass."""
     global np, cv2, ort
-    global MAVSDKController, MAVROSController, PoseSourceManager
+    global MAVROSController, PoseSourceManager, ned_to_enu_velocity
     global ActionDecomposer, ActionCollapseMonitor
     global FastLIOInterface, HALSSBayesianEvaluator, world_to_level_body_roi
+    global body_cloud_to_level_body_roi
+    global TrainingCameraModel, project_training_camera
+    global sample_nearest_points_by_camera_rays
     global MissionStateManager, StateInputs
     global SemanticGenerator, GlobalSafetyPrior
     global RealtimeVisualizer, _RUNTIME_DEPS_READY
@@ -54,14 +58,21 @@ def _import_runtime_deps():
     import numpy as _np
     import cv2 as _cv2
     import onnxruntime as _ort
-    from control import MAVSDKController as _MAVSDKController
-    from control import MAVROSController as _MAVROSController
-    from control import PoseSourceManager as _PoseSourceManager
+    from control.mavros_controller import MAVROSController as _MAVROSController, ned_to_enu_velocity as _ned_to_enu_velocity
+    from control.pose_source_manager import PoseSourceManager as _PoseSourceManager
     from control.action_decomposer import ActionDecomposer as _ActionDecomposer
     from diagnostics.action_monitor import ActionCollapseMonitor as _ActionCollapseMonitor
     from odometry import FastLIOInterface as _FastLIOInterface
     from perception.halss_bayesian import HALSSBayesianEvaluator as _HALSSBayesianEvaluator
-    from perception.halss_preprocess import world_to_level_body_roi as _world_to_level_body_roi
+    from perception.halss_preprocess import (
+        world_to_level_body_roi as _world_to_level_body_roi,
+        body_cloud_to_level_body_roi as _body_cloud_to_level_body_roi,
+    )
+    from perception.training_camera_projection import (
+        TrainingCameraModel as _TrainingCameraModel,
+        project_training_camera as _project_training_camera,
+        sample_nearest_points_by_camera_rays as _sample_nearest_points_by_camera_rays,
+    )
     from control.mission_state_manager import MissionStateManager as _MissionStateManager
     from control.mission_state_manager import StateInputs as _StateInputs
     from control.mission_state_manager import MissionState as _MissionState
@@ -72,14 +83,18 @@ def _import_runtime_deps():
     np = _np
     cv2 = _cv2
     ort = _ort
-    MAVSDKController = _MAVSDKController
     MAVROSController = _MAVROSController
     PoseSourceManager = _PoseSourceManager
+    ned_to_enu_velocity = _ned_to_enu_velocity
     ActionDecomposer = _ActionDecomposer
     ActionCollapseMonitor = _ActionCollapseMonitor
     FastLIOInterface = _FastLIOInterface
     HALSSBayesianEvaluator = _HALSSBayesianEvaluator
     world_to_level_body_roi = _world_to_level_body_roi
+    body_cloud_to_level_body_roi = _body_cloud_to_level_body_roi
+    TrainingCameraModel = _TrainingCameraModel
+    project_training_camera = _project_training_camera
+    sample_nearest_points_by_camera_rays = _sample_nearest_points_by_camera_rays
     MissionStateManager = _MissionStateManager
     StateInputs = _StateInputs
     MissionState = _MissionState
@@ -104,6 +119,22 @@ def _top_probs(probs, action_names=None, k: int = 3) -> str:
 
 def _wrap_pi(angle_rad: float) -> float:
     return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _limited_xy_velocity(dx: float, dy: float, max_speed_mps: float,
+                         kp_s: float = 1.0) -> tuple:
+    """Return a target-directed XY velocity with proportional slowdown and a hard cap."""
+    distance = math.hypot(float(dx), float(dy))
+    if distance <= 1e-9:
+        return 0.0, 0.0
+    speed = min(float(max_speed_mps), float(kp_s) * distance)
+    scale = speed / distance
+    return float(dx) * scale, float(dy) * scale
+
+
+def _limited_axis_velocity(error: float, max_speed_mps: float, kp_s: float = 1.0) -> float:
+    """Proportional single-axis velocity with a symmetric hard limit."""
+    return max(-float(max_speed_mps), min(float(max_speed_mps), float(kp_s) * float(error)))
 
 
 CLASS_TO_GRAY = {
@@ -218,9 +249,12 @@ def make_binary_semantic_vis(sem_map, safe_id=1, danger_id=9):
 
 
 class ONNXDRL:
-    """ONNX PPO policy used by the live no-control pipeline."""
+    """ONNX PPO policy used by the live MAVROS pipeline."""
 
-    def __init__(self, onnx_path: str, obs_h: int = 128, obs_w: int = 128, dmax: float = 30.0):
+    def __init__(self, onnx_path: str, obs_h: int = 128, obs_w: int = 128,
+                 dmax: float = 30.0,
+                 depth_norm_mode: str = "raw_meters_graph_scaled",
+                 semantic_norm_mode: str = "raw_gray_graph_scaled"):
         if not Path(onnx_path).is_file():
             raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
         opts = ort.SessionOptions()
@@ -234,11 +268,26 @@ class ONNXDRL:
         self.obs_h = obs_h
         self.obs_w = obs_w
         self.dmax = dmax
+        self.depth_norm_mode = depth_norm_mode
+        self.semantic_norm_mode = semantic_norm_mode
+        if self.depth_norm_mode != "raw_meters_graph_scaled":
+            raise ValueError(
+                "ONNX graph already contains input/truediv; use "
+                "observation.depth_norm_mode=raw_meters_graph_scaled"
+            )
+        if self.semantic_norm_mode != "raw_gray_graph_scaled":
+            raise ValueError(
+                "ONNX graph already contains input/truediv; use "
+                "observation.semantic_norm_mode=raw_gray_graph_scaled"
+            )
 
         dummy = np.zeros((1, obs_h, obs_w, 2), dtype=np.float32)
         self._forward(dummy)
-        logger.info("[ONNX] model=%s input=%s shape=%s layout=%s warmup=OK",
-                    onnx_path, self.input_name, in_shape, self.layout)
+        logger.info(
+            "[ONNX] model=%s input=%s shape=%s layout=%s "
+            "external_encoding=(raw_depth_m,raw_gray), graph_scale=/255 warmup=OK",
+            onnx_path, self.input_name, in_shape, self.layout,
+        )
 
     def _forward(self, obs_raw):
         if self.layout == "chw":
@@ -253,6 +302,8 @@ class ONNXDRL:
             0.0,
             self.dmax,
         )
+        # The exported graph contains SB2 policy scale=True as input/truediv.
+        # Feed the same raw Box(0,255) values used by training exactly once.
         depth_ch = depth_clipped.astype(np.float32)
 
         sem_int = np.clip(sem_map, -1, 9).astype(np.int16)
@@ -266,6 +317,8 @@ class ONNXDRL:
         exps = np.exp(logits - float(np.max(logits)))
         probs = exps / max(float(np.sum(exps)), 1e-12)
         action = int(np.argmax(logits))
+        depth_after_graph_scale = depth_ch / 255.0
+        sem_after_graph_scale = sem_ch / 255.0
 
         info = {
             "depth_raw_median": float(np.median(depth_map)),
@@ -275,18 +328,18 @@ class ONNXDRL:
             "sem_input_mean": float(sem_ch.mean()),
             "sem_input_min": float(sem_ch.min()),
             "sem_input_max": float(sem_ch.max()),
-            "sem_input_unique": sorted(np.unique(sem_ch).astype(int).tolist()),
+            "sem_input_unique": [round(float(x), 6) for x in sorted(np.unique(sem_ch))],
             "obs_raw_min": float(obs.min()),
             "obs_raw_max": float(obs.max()),
             "softmax_probs": probs.astype(float).tolist(),
             "action_probs": probs.astype(float).tolist(),
             "confidence": float(np.max(probs)),
-            "depth_norm_min": float(depth_ch.min()),
-            "depth_norm_mean": float(depth_ch.mean()),
-            "depth_norm_max": float(depth_ch.max()),
-            "sem_norm_min": float(sem_ch.min()),
-            "sem_norm_mean": float(sem_ch.mean()),
-            "sem_norm_max": float(sem_ch.max()),
+            "depth_norm_min": float(depth_after_graph_scale.min()),
+            "depth_norm_mean": float(depth_after_graph_scale.mean()),
+            "depth_norm_max": float(depth_after_graph_scale.max()),
+            "sem_norm_min": float(sem_after_graph_scale.min()),
+            "sem_norm_mean": float(sem_after_graph_scale.mean()),
+            "sem_norm_max": float(sem_after_graph_scale.max()),
             "logits": logits.astype(float).tolist(),
         }
         return action, info
@@ -308,7 +361,9 @@ def _validate_global_guidance_override(args):
     failures = []
     if getattr(args, "safe_point", None):
         try:
-            _parse_safe_point(args.safe_point)
+            lat, lon = _parse_safe_point(args.safe_point)
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                raise ValueError("latitude/longitude outside valid ranges")
         except ValueError as exc:
             failures.append(f"flight-ready gate: invalid --safe-point ({exc})")
         if getattr(args, "safe_point_source", "manual") != "gis":
@@ -363,15 +418,25 @@ def _parse_safe_point(value: str):
 
 
 def _load_config(path: str) -> dict:
+    config_path = Path(path).resolve()
     try:
         import yaml
-        with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+        with open(config_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
     except ModuleNotFoundError as exc:
         if exc.name != "yaml":
             raise
         from preflight_check import _load_simple_yaml
-        return _load_simple_yaml(Path(path))
+        cfg = _load_simple_yaml(config_path)
+
+    parent = cfg.pop("extends", None)
+    if parent:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute():
+            parent_path = config_path.parent / parent_path
+        base = _load_config(str(parent_path))
+        return _merge_config_overrides(base, cfg)
+    return cfg
 
 
 def _merge_config_overrides(cfg: dict, overrides: dict) -> dict:
@@ -388,15 +453,12 @@ def _build_config_overrides(args) -> dict:
     overrides = {}
     if getattr(args, "yaw_rate_rad_s", None) is not None:
         overrides.setdefault("uav", {})["yaw_rate_rad_s"] = float(args.yaw_rate_rad_s)
-    if getattr(args, "depth_output_scale", None) is not None:
-        overrides.setdefault("depth_completion", {})["output_scale"] = float(args.depth_output_scale)
+    if getattr(args, "allow_high_yaw_rate_test", False):
+        overrides.setdefault("uav", {})["high_yaw_rate_test_enabled"] = True
     if getattr(args, "dmax", None) is not None:
         overrides.setdefault("depth_projection", {})["max_range"] = float(args.dmax)
-        overrides.setdefault("zmq_pipeline", {}).setdefault("drl_control", {})["dmax"] = float(args.dmax)
     if getattr(args, "onnx_model", None):
-        overrides.setdefault("zmq_pipeline", {}).setdefault("drl_control", {})[
-            "onnx_model_path"
-        ] = args.onnx_model
+        overrides.setdefault("decision", {})["onnx_model_path"] = args.onnx_model
     return overrides
 
 
@@ -406,7 +468,6 @@ class OrinLandingPipeline:
     def __init__(
         self,
         config_path: str,
-        mavsdk_address: str = None,
         config_overrides: dict = None,
         onnx_model_path: str = None,
     ):
@@ -422,23 +483,18 @@ class OrinLandingPipeline:
         # --- 飞控后端抽象 ---
         fc_cfg = self.cfg.get("flight_controller", {})
         fc_backend = str(fc_cfg.get("backend", "mavros")).lower()
-        self._fc_backend = fc_backend
-        if fc_backend == "mavros":
-            self._mavsdk_address = None
-            self._mavros_ns = str(fc_cfg.get("mavros_ns", "/mavros"))
-            self._setpoint_rate_hz = float(fc_cfg.get("setpoint_rate_hz", 20))
-            self._offboard_warmup_s = float(fc_cfg.get("offboard_warmup_s", 2.0))
-        else:
-            self._mavsdk_address = mavsdk_address or self.cfg.get("uav", {}).get(
-                "mavsdk_address", "udp://:14540"
-            )
-            self._mavros_ns = None
+        if fc_backend != "mavros":
+            raise ValueError("The live pipeline supports flight_controller.backend=mavros only")
+        self._fc_backend = "mavros"
+        self._mavros_ns = str(fc_cfg.get("mavros_ns", "/mavros"))
+        self._setpoint_rate_hz = float(fc_cfg.get("setpoint_rate_hz", 20))
+        self._offboard_warmup_s = float(fc_cfg.get("offboard_warmup_s", 2.0))
 
         obs_cfg = self.cfg["observation"]
         perc_cfg = self.cfg["perception"]
         depth_cfg = self.cfg["depth_projection"]
         uav_cfg = self.cfg["uav"]
-        drl_cfg = self.cfg.get("zmq_pipeline", {}).get("drl_control", {})
+        drl_cfg = self.cfg.get("decision", {})
 
         self.depth_max = float(depth_cfg.get("max_range", 30.0))
         self.obs_h = int(obs_cfg.get("img_height", 128))
@@ -446,18 +502,46 @@ class OrinLandingPipeline:
         self.safe_id = int(perc_cfg.get("safe_class_id", 1))
         self.danger_id = int(perc_cfg.get("danger_class_id", 9))
         self.sim_dt = float(uav_cfg.get("sim_dt", 0.25))
-        self.target_altitude = float(uav_cfg.get("target_altitude", 0.5))
         self.max_steps = int(float(uav_cfg.get("max_t", 90.0)) / self.sim_dt)
         self.yaw_rate_cmd = float(uav_cfg.get("yaw_rate_rad_s", 0.0))
+        self.max_roll_pitch_rad = math.radians(float(uav_cfg.get("max_roll_pitch_deg", 30.0)))
+        self.execution_yaw_source = str(
+            uav_cfg.get("execution_yaw_source", "px4_ekf")
+        ).lower()
+        if self.execution_yaw_source not in ("px4_ekf", "fastlio"):
+            raise ValueError("uav.execution_yaw_source must be px4_ekf or fastlio")
         runtime_cfg = self.cfg.get("runtime", {})
-        self.max_frame_latency_ms = float(runtime_cfg.get("max_frame_latency_ms", 100.0))
+        self.max_inference_result_age_ms = float(
+            runtime_cfg.get("max_inference_result_age_ms", 500.0)
+        )
+        self.drop_stale_frames = bool(runtime_cfg.get("drop_stale_frames", True))
         self.drop_slow_frames = bool(runtime_cfg.get("drop_slow_frames", True))
         self.max_cloud_odom_sync_ms = float(runtime_cfg.get("max_cloud_odom_sync_ms", 100.0))
         localization_cfg = self.cfg.get("localization", {})
+        self.localization_mode = str(
+            localization_cfg.get("mode", "gps_px4_fastlio_perception")
+        ).lower()
+        self.px4_position_source = str(
+            localization_cfg.get("px4_position_source", "gps")
+        ).lower()
+        self.external_pose_topic = str(
+            localization_cfg.get("external_pose_topic", "/mavros/vision_pose/pose")
+        )
         self.fastlio_odom_topic = localization_cfg.get("fastlio_odom_topic", "/Odometry")
-        self.fastlio_cloud_topic = localization_cfg.get("world_cloud_topic", "/cloud_registered")
-        self._yaw_setpoint_rad = None
-        self._last_yaw_update_t = None
+        self._use_body_cloud = bool(
+            localization_cfg.get(
+                "use_body_cloud",
+                self.localization_mode == "gps_px4_fastlio_perception",
+            )
+        )
+        self.fastlio_cloud_topic = (
+            localization_cfg.get("body_cloud_topic", "/cloud_registered_body")
+            if self._use_body_cloud
+            else localization_cfg.get("world_cloud_topic", "/cloud_registered")
+        )
+        self._home_enu = np.zeros(3, dtype=np.float32)  # ENU home (takeoff point)
+        self._takeoff_altitude_m = 0.0  # set during run()
+        self._pre_goto_yaw_enu_deg = 0.0
 
         logger.info("=" * 60)
         logger.info(" Initializing Orin Landing Pipeline...")
@@ -482,9 +566,11 @@ class OrinLandingPipeline:
             obs_h=self.obs_h,
             obs_w=self.obs_w,
             dmax=self.depth_max,
+            depth_norm_mode=str(obs_cfg.get("depth_norm_mode", "raw_meters_graph_scaled")),
+            semantic_norm_mode=str(obs_cfg.get("semantic_norm_mode", "raw_gray_graph_scaled")),
         )
         logger.info(
-            "[Init] Perception route: HALSS + BEV NN-fill depth + ONNX DRL "
+            "[Init] Perception route: HALSS + training-camera NN-fill depth + ONNX DRL "
             "(dmax=%.1fm, obs=%dx%d)",
             self.depth_max,
             self.obs_w,
@@ -499,8 +585,19 @@ class OrinLandingPipeline:
             self.decomposer.action_lateral_sign,
             self.decomposer.action_id_to_name(3),
         )
+        logger.info("[Init] Body-action execution yaw source=%s", self.execution_yaw_source)
+        logger.info(
+            "[Init] Localization mode=%s px4_position_source=%s global_prior=%s "
+            "yaw_rate=%.3frad/s setpoint_rate=%.1fHz",
+            self.localization_mode,
+            self.px4_position_source,
+            self.cfg.get("global_prior", {}).get("mode", "gps"),
+            self.yaw_rate_cmd,
+            self._setpoint_rate_hz,
+        )
 
-        logger.info("[Init] Fast-LIO interface...")
+        logger.info("[Init] Fast-LIO interface (cloud=%s body_mode=%s)...",
+                    self.fastlio_cloud_topic, self._use_body_cloud)
         self.fastlio = FastLIOInterface(use_ros=True)
 
         logger.info("[Init] Pose source manager...")
@@ -510,7 +607,7 @@ class OrinLandingPipeline:
         self.visualizer = RealtimeVisualizer(self.cfg["visualization"])
         self.action_monitor = ActionCollapseMonitor(self.cfg.get("visualization", {}), logger)
 
-        self.fc = None  # 统一飞控抽象 (MAVROSController 或 MAVSDKController)
+        self.fc = None  # MAVROS flight-controller adapter
         self.step_count = 0
 
         self._safe_lat = None
@@ -520,18 +617,44 @@ class OrinLandingPipeline:
         self._home_ned = np.zeros(3, dtype=np.float32)
         self._home_lat = None
         self._home_lon = None
+        self._direct_land_enu_xy = None
+        self._horizontal_hold_enu_xy = None
         self._goto_tolerance_xy = float(self.cfg.get("global_prior", {}).get("goto_tolerance_xy_m", 0.2))
         self._goto_tolerance_z = float(self.cfg.get("global_prior", {}).get("goto_tolerance_z_m", 0.15))
         self._goto_max_time_s = float(self.cfg.get("global_prior", {}).get("goto_max_time_s", 30.0))
         self._goto_timeout_action = str(self.cfg.get("global_prior", {}).get("goto_timeout_action", "direct_land")).lower()
-        self._goto_speed_xy = float(self.cfg.get("global_prior", {}).get("goto_speed_xy_ms", 0.2))
-        self._goto_speed_z = float(self.cfg.get("global_prior", {}).get("goto_speed_z_ms", 0.25))
+        goto_speed = self.cfg.get("global_prior", {}).get("goto_max_horizontal_speed_mps")
+        self._goto_max_horizontal_speed_mps = (
+            None
+            if goto_speed is None or self.localization_mode != "gps_px4_fastlio_perception"
+            else float(goto_speed)
+        )
+        self._goto_horizontal_kp_s = float(
+            self.cfg.get("global_prior", {}).get("goto_horizontal_kp_s", 1.0)
+        )
+        self._goto_max_vertical_speed_mps = float(
+            self.cfg.get("global_prior", {}).get("goto_max_vertical_speed_mps", 1.0)
+        )
+        if (
+            self._goto_max_horizontal_speed_mps is not None
+            and self._goto_max_horizontal_speed_mps <= 0.0
+        ):
+            raise ValueError("global_prior.goto_max_horizontal_speed_mps must be > 0")
+        if self._goto_horizontal_kp_s <= 0.0:
+            raise ValueError("global_prior.goto_horizontal_kp_s must be > 0")
+        if self._goto_max_vertical_speed_mps <= 0.0:
+            raise ValueError("global_prior.goto_max_vertical_speed_mps must be > 0")
         self._use_global_guidance = False
         self._indoor_local_mode = False
         self._local_body_offset_m = None
         self._safe_altitude_m = None  # GPS mode target altitude
         self._configure_global_prior_from_config()
         mission_cfg = dict(self.cfg.get("mission_state", {}))
+        # global_prior.mode is the single public source of truth. The state
+        # manager keeps its legacy internal key for compatibility.
+        mission_cfg["global_prior_mode"] = str(
+            self.cfg.get("global_prior", {}).get("mode", "gps")
+        ).lower()
         mission_cfg.setdefault("max_cloud_odom_sync_ms", self.max_cloud_odom_sync_ms)
         self.state_manager = MissionStateManager(mission_cfg)
         self.mission_state = self.state_manager.state.value
@@ -547,7 +670,43 @@ class OrinLandingPipeline:
         self._roi_min_half_m = float(perc_cfg_roi.get("halss_roi_min_half_m", 0.5))
         self._roi_max_half_m = float(perc_cfg_roi.get("halss_roi_max_half_m", 15.0))
         self._roi_height_source = str(perc_cfg_roi.get("halss_roi_height_source", "pose_z"))
-        self._ground_z_world = 0.0  # set during run() after takeoff
+        self._ground_z_world = 0.0  # FAST-LIO world z indoors; PX4 launch ENU z outdoors
+        self._projection_mode = str(depth_cfg.get("mode", "training_camera")).lower()
+        self._training_camera = TrainingCameraModel.from_config(
+            depth_cfg.get("training_camera", {}),
+            output_width=self.obs_w,
+            output_height=self.obs_h,
+            far_m=self.depth_max,
+        )
+        self._halss_pinhole_ray_sampling = bool(
+            perc_cfg_roi.get("halss_pinhole_ray_sampling_enabled", False)
+        )
+        self._halss_ray_grid_res = int(
+            perc_cfg_roi.get("halss_pinhole_ray_grid_res", 64)
+        )
+        if self._halss_ray_grid_res <= 0:
+            raise ValueError("perception.halss_pinhole_ray_grid_res must be positive")
+        if self._projection_mode not in ("training_camera", "level_body_bev"):
+            raise ValueError("depth_projection.mode must be training_camera or level_body_bev")
+        logger.info(
+            "[Init] Projection=%s FOV=%.1fx%.1fdeg scaled_intrinsics="
+            "fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
+            self._projection_mode,
+            self._training_camera.horizontal_fov_deg,
+            self._training_camera.vertical_fov_deg,
+            self._training_camera.fx,
+            self._training_camera.fy,
+            self._training_camera.cx,
+            self._training_camera.cy,
+        )
+        if self._use_body_cloud:
+            logger.info(
+                "[Init] HALSS body-cloud sampling=%s ray_grid=%dx%d max_points=%d",
+                "pinhole_nearest" if self._halss_pinhole_ray_sampling else "disabled",
+                self._halss_ray_grid_res,
+                self._halss_ray_grid_res,
+                self._halss_ray_grid_res ** 2,
+            )
 
         # --- velocity command CSV logger ---
         self._vel_log_path = None
@@ -559,6 +718,18 @@ class OrinLandingPipeline:
         self._drl_log_path = None
         self._drl_log_file = None
         self._drl_log_writer = None
+
+        # --- mission timeline + per-frame perception timing CSV ---
+        self._event_log_path = None
+        self._event_log_file = None
+        self._event_log_writer = None
+        self._recorded_mission_events = set()
+        self._frame_timing_path = None
+        self._frame_timing_file = None
+        self._frame_timing_writer = None
+        self._perception_gate_path = None
+        self._perception_gate_file = None
+        self._perception_gate_writer = None
 
         # --- rosbag recording ---
         self._record_bag = False
@@ -647,7 +818,7 @@ class OrinLandingPipeline:
         logger.info("[GlobalPrior] Safe point from %s: lat=%.7f lon=%.7f", source, lat, lon)
 
     def enforce_flight_ready(self):
-        """Fail before ROS/MAVSDK startup if full-experiment gates are not met."""
+        """Fail before ROS/MAVROS startup if full-experiment gates are not met."""
         failures = flight_ready_failures(
             self.cfg,
             global_guidance_ready=bool(self._use_global_guidance),
@@ -691,22 +862,143 @@ class OrinLandingPipeline:
             logger.error("[ROS1] Failed to init: %s", e)
             return False
 
+    async def _verify_localization_profile_online(self) -> None:
+        """Reject a mismatched FAST-LIO/PX4 localization setup before arming."""
+        if self.localization_mode == "fastlio_external_vision":
+            from geometry_msgs.msg import PoseStamped
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._rospy.wait_for_message(
+                        self.external_pose_topic, PoseStamped, timeout=5.0
+                    ),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Indoor profile requires live external vision on {self.external_pose_topic}; "
+                    "launch FAST-LIO with external_vision:=true"
+                ) from exc
+            if not getattr(self.fc, "_enu_ready", False):
+                raise RuntimeError("Indoor profile requires /mavros/local_position/odom")
+            logger.info(
+                "[Localization] Indoor gate passed: external vision + MAVROS local odom live"
+            )
+            return
+
+        deadline = time.perf_counter() + 10.0
+        while not getattr(self.fc, "_gps_ready", False) and time.perf_counter() < deadline:
+            await asyncio.sleep(0.05)
+        if not getattr(self.fc, "_gps_ready", False) or not getattr(self.fc, "_enu_ready", False):
+            raise RuntimeError("Outdoor profile requires valid GPS and MAVROS local odometry")
+        localization_cfg = self.cfg.get("localization", {})
+        gps_ok, gps_reason = self.fc.gps_health(
+            max_age_s=float(localization_cfg.get("max_gps_age_s", 2.0)),
+            max_horizontal_accuracy_m=float(
+                localization_cfg.get("max_gps_horizontal_accuracy_m", 5.0)
+            ),
+        )
+        if not gps_ok:
+            raise RuntimeError(f"Outdoor PX4 GPS health gate failed: {gps_reason}")
+        if gps_reason == "ok_covariance_unknown":
+            logger.warning(
+                "[Localization] GPS fix is valid but NavSatFix covariance is unknown"
+            )
+        # FAST-LIO advertises the topic in both modes, so publisher presence is
+        # not sufficient. Outdoor mode rejects actual messages in a quiet
+        # observation window.
+        from geometry_msgs.msg import PoseStamped
+        vision_message_seen = False
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: self._rospy.wait_for_message(
+                    self.external_pose_topic, PoseStamped, timeout=1.0
+                ),
+            )
+            vision_message_seen = True
+        except Exception:
+            pass
+        if vision_message_seen:
+            raise RuntimeError(
+                f"Outdoor profile forbids FAST-LIO injection on {self.external_pose_topic}; "
+                "launch FAST-LIO with external_vision:=false"
+            )
+        logger.info(
+            "[Localization] Outdoor gate passed: GPS/local odom live (%s), vision injection absent",
+            gps_reason,
+        )
+
+    async def _verify_fastlio_static_initialization(self) -> None:
+        """Fail before arming if the outdoor FAST-LIO process is already divergent."""
+        cfg = self.cfg.get("fastlio_health", {})
+        if not bool(cfg.get("require_static_initialization", True)):
+            return
+        duration = float(cfg.get("static_initialization_s", 5.0))
+        max_drift = float(cfg.get("static_max_drift_m", 0.2))
+        max_norm = float(cfg.get("initial_position_norm_max_m", 50.0))
+
+        try:
+            import rosgraph
+            master = rosgraph.Master(self._ros_node or "/orin_landing")
+            publishers, _, _ = master.getSystemState()
+            count = len(next((nodes for topic, nodes in publishers
+                              if topic == self.fastlio_odom_topic), []))
+            if count != 1:
+                raise RuntimeError(
+                    f"{self.fastlio_odom_topic} must have exactly one publisher; got {count}"
+                )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"cannot verify FAST-LIO publisher count: {exc}") from exc
+
+        samples = []
+        start = time.perf_counter()
+        start_cloud_seq = self.fastlio.points_seq
+        while time.perf_counter() - start < duration:
+            pose = self.fastlio.pose
+            if pose is not None and np.isfinite(pose).all():
+                samples.append(np.asarray(pose, dtype=np.float64).copy())
+            await asyncio.sleep(0.05)
+        if len(samples) < max(10, int(duration * 5)):
+            raise RuntimeError("FAST-LIO static gate: insufficient finite /ali_odom samples")
+        if self.fastlio.points_seq <= start_cloud_seq:
+            raise RuntimeError("FAST-LIO static gate: body cloud did not advance")
+        xyz = np.asarray([sample[:3] for sample in samples])
+        drift = float(np.max(np.linalg.norm(xyz - xyz[0], axis=1)))
+        initial_norm = float(np.linalg.norm(xyz[0]))
+        quat_norm = self.fastlio.quaternion_norm
+        covariance = self.fastlio.pose_covariance
+        if initial_norm > max_norm:
+            raise RuntimeError(
+                f"FAST-LIO static gate: initial position norm {initial_norm:.1f}m > {max_norm:.1f}m; restart FAST-LIO"
+            )
+        if drift > max_drift:
+            raise RuntimeError(
+                f"FAST-LIO static gate: drift {drift:.3f}m/{duration:.1f}s > {max_drift:.3f}m"
+            )
+        if quat_norm is None or not math.isfinite(quat_norm) or abs(quat_norm - 1.0) > 0.01:
+            raise RuntimeError(f"FAST-LIO static gate: invalid quaternion norm {quat_norm}")
+        if covariance is None or not np.isfinite(covariance).all():
+            raise RuntimeError("FAST-LIO static gate: covariance is missing or non-finite")
+        logger.info(
+            "[FastLIOStatic] Passed: publishers=1 samples=%d initial_norm=%.3fm drift=%.3fm quat=%.6f",
+            len(samples), initial_norm, drift, quat_norm,
+        )
+
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
     async def run(self):
-        # --- 创建飞控控制器 ---
-        if self._fc_backend == "mavros":
-            self.fc = MAVROSController(
-                mavros_ns=self._mavros_ns,
-                setpoint_rate_hz=self._setpoint_rate_hz,
-                offboard_warmup_s=self._offboard_warmup_s,
-            )
-            logger.info("[Pipeline] Using MAVROS flight controller (ns=%s)", self._mavros_ns)
-        else:
-            self.fc = MAVSDKController(system_address=self._mavsdk_address)
-            logger.info("[Pipeline] Using MAVSDK flight controller (addr=%s)", self._mavsdk_address)
+        self.fc = MAVROSController(
+            mavros_ns=self._mavros_ns,
+            setpoint_rate_hz=self._setpoint_rate_hz,
+            offboard_warmup_s=self._offboard_warmup_s,
+        )
+        logger.info("[Pipeline] Using MAVROS flight controller (ns=%s)", self._mavros_ns)
 
         await self.fc.connect()
 
@@ -715,67 +1007,96 @@ class OrinLandingPipeline:
             await asyncio.sleep(0.02)
         logger.info("[Pipeline] FAST-LIO ready.")
 
+        await self._verify_localization_profile_online()
+
         # --- 启动录包 (若启用) ---
-        await self._start_recording()
-
-        # --- 新流程: 持续发送当前位置 hold, 等待遥控器 OFFBOARD+解锁 ---
-        if self._fc_backend == "mavros":
-            self.fc.start_hold_stream()
-            logger.info("[Pipeline] Hold stream started. Waiting for RC OFFBOARD+arm...")
-            rc_ok = await self.fc.wait_for_manual_offboard_and_arm(timeout_s=120.0)
-            if not rc_ok:
-                logger.error("[Pipeline] RC OFFBOARD+arm timeout. Aborting.")
+        recording_ok = await self._start_recording()
+        record_cfg = self.cfg.get("experiment_recording", {})
+        if self._record_bag and record_cfg.get("required", False) and not recording_ok:
+            raise RuntimeError("Required rosbag recording failed before arming")
+        if self._use_body_cloud:
+            try:
+                await self._verify_fastlio_static_initialization()
+            except Exception:
                 await self._stop_recording()
-                await self._shutdown()
-                return
-            logger.info("[Pipeline] RC OFFBOARD+arm confirmed. Proceeding to mission.")
-        else:
-            # MAVSDK: 保持原有 arm + init_offboard 流程
-            await self._takeoff_legacy()
+                raise
 
-        # --- 记录 home 点 ---
-        local_ned, local_attitude = await self.fc.wait_for_local_pose(timeout_s=10.0)
-        self._home_ned = local_ned
-        self._yaw_setpoint_rad = float(local_attitude[2])
-        self._last_yaw_update_t = time.perf_counter()
-        # 记录起飞点 Fast-LIO 世界 z 作为地面参考 (用于动态 FOV ROI)
-        if self.fastlio.pose is not None:
+        # Capture the launch reference while the aircraft is still on the
+        # ground.  Manual climb before OFFBOARD must never redefine zero height.
+        launch_ned, launch_attitude = await self.fc.wait_for_local_pose(timeout_s=10.0)
+        self._home_ned = launch_ned.copy()
+        self._home_enu = self.fc.uavPosENU.copy()
+        self._pre_goto_yaw_enu_deg = math.degrees(float(self.fc.uavYawENU))
+        self._launch_attitude_ned = launch_attitude.copy()
+        if self._use_global_guidance and not self._indoor_local_mode:
+            _, launch_lat_lon, _ = await self.fc.wait_for_home(timeout_s=10.0)
+            self._home_lat, self._home_lon = launch_lat_lon
+        if self._use_body_cloud:
+            self._ground_z_world = float(self._home_enu[2])
+            self.state_manager.ground_z_ref_m = self._ground_z_world
+            self.state_manager.height_source = "px4_enu_z"
+            self.state_manager.height_axis = "pos_z"
+        elif self.fastlio.pose is not None:
             self._ground_z_world = float(self.fastlio.pose[2])
+            if self.state_manager.auto_ground_z_ref:
+                self.state_manager.ground_z_ref_m = self._ground_z_world
+        self._log_mission_event("LAUNCH_REFERENCE", reason="ground_reference_captured")
         logger.info(
-            "[Pipeline] Home: ned=%s yaw=%.1fdeg ground_z=%.2f",
-            _fmt_vec(self._home_ned),
-            math.degrees(self._yaw_setpoint_rad),
+            "[Pipeline] Ground launch reference: NED=%s ENU=%s gps=%s ground_z=%.2f",
+            _fmt_vec(self._home_ned), _fmt_vec(self._home_enu),
+            "n/a" if self._home_lat is None else f"{self._home_lat:.7f},{self._home_lon:.7f}",
             self._ground_z_world,
         )
+
+        # --- 新流程: 持续发送当前位置 hold, 等待遥控器 OFFBOARD+解锁 ---
+        self.fc.start_hold_stream()
+        logger.info("[Pipeline] Hold stream started. Waiting for RC OFFBOARD+arm...")
+        rc_ok = await self.fc.wait_for_manual_offboard_and_arm(
+            timeout_s=120.0,
+            # Keep yaw fixed while recording home and during vertical takeoff.
+            # The planned yaw fault starts only when GOTO_SAFE begins.
+            post_arm_yaw_rate_rad_s=None,
+        )
+        if not rc_ok:
+            logger.error("[Pipeline] RC OFFBOARD+arm timeout. Aborting.")
+            await self._stop_recording()
+            await self._shutdown()
+            return
+        logger.info("[Pipeline] RC OFFBOARD+arm confirmed. Proceeding to mission.")
+        self._log_mission_event("ARMED", reason="manual_offboard_and_arm_confirmed")
+
+        # The handoff point is diagnostic only; the ground launch reference
+        # captured above remains authoritative.
+        local_ned, local_attitude = await self.fc.wait_for_local_pose(timeout_s=10.0)
+        self._handoff_enu = self.fc.uavPosENU.copy()
+        self._log_mission_event("OFFBOARD_HANDOFF", reason="manual_climb_complete")
         logger.info(
-            "[Pipeline] Local telemetry: ned=%s yaw=%.1fdeg",
+            "[Pipeline] Home: ned=%s enu=%s ground_z=%.2f",
             _fmt_vec(self._home_ned),
-            math.degrees(self._yaw_setpoint_rad),
+            _fmt_vec(self._home_enu),
+            self._ground_z_world,
         )
 
         if self._indoor_local_mode:
             self._safe_ned_target = self._compute_local_ned_target_3d(
-                self._home_ned, self._yaw_setpoint_rad,
+                self._home_ned, float(local_attitude[2]),
             )
+            self._takeoff_altitude_m = float(self._local_body_offset_m[2])
             logger.info(
-                "[Pipeline] Indoor 3D safe point: NED=%s offset=(%.2f,%.2f,%.2f)m yaw0=%.1fdeg",
+                "[Pipeline] Indoor 3D safe point: NED=%s offset=(%.2f,%.2f,%.2f)m takeoff_alt=%.1fm",
                 _fmt_vec(self._safe_ned_target),
                 self._local_body_offset_m[0], self._local_body_offset_m[1],
                 self._local_body_offset_m[2],
-                math.degrees(self._yaw_setpoint_rad),
+                self._takeoff_altitude_m,
             )
             self._apply_state_decision(self.state_manager.start_after_takeoff(True))
 
         elif self._use_global_guidance:
-            home_ned, home_lat_lon, home_attitude = await self.fc.wait_for_home(timeout_s=10.0)
-            self._home_ned = home_ned
-            self._home_lat, self._home_lon = home_lat_lon
-            self._yaw_setpoint_rad = float(home_attitude[2])
-            self._last_yaw_update_t = time.perf_counter()
+            self._takeoff_altitude_m = float(self._safe_altitude_m)
             logger.info(
-                "[Pipeline] Home telemetry: lat=%.7f lon=%.7f ned=%s yaw=%.1fdeg",
+                "[Pipeline] Home telemetry: lat=%.7f lon=%.7f ned=%s takeoff_alt=%.1fm",
                 self._home_lat, self._home_lon, _fmt_vec(self._home_ned),
-                math.degrees(self._yaw_setpoint_rad),
+                self._takeoff_altitude_m,
             )
 
             if self._safe_ned is None:
@@ -800,86 +1121,96 @@ class OrinLandingPipeline:
             self._apply_state_decision(self.state_manager.start_after_takeoff(False))
             logger.info("[Pipeline] No global prior. Starting DRL descent.")
 
-        if self.mission_state == "GOTO_SAFE":
-            await self._goto_safe_point()
+        # --- Phase 1: vertical takeoff to safe altitude (if global guidance) ---
+        if self._indoor_local_mode or self._use_global_guidance:
+            print(f"\n>>> Phase 1: Taking off to {self._takeoff_altitude_m:.1f}m ...", flush=True)
+            self._log_mission_event(
+                "TAKEOFF_STARTED", reason=f"target_altitude_m={self._takeoff_altitude_m:.3f}"
+            )
+            reached_high_altitude = await self._vertical_takeoff(self._takeoff_altitude_m)
+            if reached_high_altitude:
+                self._log_mission_event(
+                    "HIGH_ALTITUDE_REACHED",
+                    reason=f"target_altitude_m={self._takeoff_altitude_m:.3f}",
+                )
+            else:
+                logger.warning(
+                    "[MissionEvent] HIGH_ALTITUDE_REACHED not recorded: target tolerance not met"
+                )
+                self._apply_state_decision(self.state_manager.reset(
+                    MissionState.HOLD_FOR_MANUAL,
+                    "takeoff_staging_timeout",
+                ))
+                self._log_mission_event(
+                    "MANUAL_TAKEOVER_REQUESTED",
+                    reason="takeoff_staging_timeout",
+                )
+            print(f">>> Phase 1 complete. mission_state={self.mission_state}", flush=True)
 
+        if self.mission_state == "GOTO_SAFE":
+            print(f"\n>>> Phase 2: Moving to safe point ...", flush=True)
+            self._log_mission_event("GOTO_STARTED", reason="goto_safe_phase_started")
+            await self._goto_safe_point()
+            print(f">>> Phase 2 complete. mission_state={self.mission_state}", flush=True)
+
+        if self.mission_state == "HOLD_FOR_MANUAL":
+            await self._hold_for_manual_takeover()
+            await self._shutdown()
+            return
+        if self.mission_state in ("ABORT", "IDLE"):
+            await self._shutdown()
+            return
+
+        # --- GPU warmup: 在安全点运行一帧 HALSS + depth + DRL, 预热 CUDA ---
+        print(f"\n>>> GPU warmup at safe point ...", flush=True)
+        warmup_ok = await self._warmup_perception()
+        if not warmup_ok:
+            self._apply_state_decision(self.state_manager.reset(
+                MissionState.HOLD_FOR_MANUAL,
+                "perception_warmup_failed",
+            ))
+            self._log_mission_event(
+                "MANUAL_TAKEOVER_REQUESTED",
+                reason="perception_warmup_failed",
+            )
+            await self._hold_for_manual_takeover()
+            await self._shutdown()
+            return
+        print(f">>> GPU warmup complete.", flush=True)
+
+        print(f"\n>>> Starting DRL descent loop ...", flush=True)
         await self._run_descent_loop()
         await self._shutdown()
 
-    async def _takeoff_legacy(self):
-        """[MAVSDK only] Legacy arm + init_offboard takeoff flow."""
-        logger.info("[Pipeline] Arming and entering offboard...")
-        await self.fc.arm()
-        await asyncio.sleep(1.0)
-        await self.fc.init_offboard()
-        await asyncio.sleep(0.5)
-
-        local_ned, local_attitude = await self.fc.wait_for_local_pose(timeout_s=10.0)
-        self._home_ned = local_ned
-        self._yaw_setpoint_rad = float(local_attitude[2])
-        self._last_yaw_update_t = time.perf_counter()
-        logger.info(
-            "[Pipeline] Local telemetry: ned=%s yaw=%.1fdeg",
-            _fmt_vec(self._home_ned),
-            math.degrees(self._yaw_setpoint_rad),
-        )
-
-        if self._indoor_local_mode:
-            self._safe_ned_target = self._compute_local_ned_target_3d(
-                self._home_ned, self._yaw_setpoint_rad,
-            )
-            logger.info(
-                "[Pipeline] Indoor 3D safe point: NED=%s offset=(%.2f,%.2f,%.2f)m yaw0=%.1fdeg",
-                _fmt_vec(self._safe_ned_target),
-                self._local_body_offset_m[0], self._local_body_offset_m[1],
-                self._local_body_offset_m[2],
-                math.degrees(self._yaw_setpoint_rad),
-            )
-            self._apply_state_decision(self.state_manager.start_after_takeoff(True))
-
-        elif self._use_global_guidance:
-            home_ned, home_lat_lon, home_attitude = await self.fc.wait_for_home(timeout_s=10.0)
-            self._home_ned = home_ned
-            self._home_lat, self._home_lon = home_lat_lon
-            self._yaw_setpoint_rad = float(home_attitude[2])
-            self._last_yaw_update_t = time.perf_counter()
-            logger.info(
-                "[Pipeline] Home telemetry: lat=%.7f lon=%.7f ned=%s yaw=%.1fdeg",
-                self._home_lat, self._home_lon, _fmt_vec(self._home_ned),
-                math.degrees(self._yaw_setpoint_rad),
-            )
-
-            if self._safe_ned is None:
-                self._safe_ned = self._gps_to_ned_offset_3d(
-                    self._safe_lat, self._safe_lon, self._safe_altitude_m,
-                )
-            logger.info(
-                "[Pipeline] GPS 3D target: lat=%.7f lon=%.7f alt=%.1fm → NED=%s",
-                self._safe_lat, self._safe_lon, self._safe_altitude_m,
-                _fmt_vec(self._safe_ned),
-            )
-
-            dist_xy = float(np.linalg.norm(self._safe_ned[:2] - self._home_ned[:2]))
-            dist_z = abs(self._safe_ned[2] - self._home_ned[2])
-            if dist_xy <= 1e-3 and dist_z <= 0.5:
-                raise RuntimeError(
-                    "[GlobalPrior] Safe point too close to home; "
-                    "home GPS may be unavailable or target equals takeoff position."
-                )
-            self._apply_state_decision(self.state_manager.start_after_takeoff(True))
-        else:
-            self._apply_state_decision(self.state_manager.start_after_takeoff(False))
-            logger.info("[Pipeline] No global prior. Starting DRL descent.")
+    # The former MAVSDK arm/offboard branch was intentionally removed from the
+    # live entry point. Historical MAVSDK adapters remain in control/ only for
+    # old offline tools; real flights use MAVROS and manual RC OFFBOARD + arm.
 
     async def _run_descent_loop(self):
         logger.info("[Pipeline] Starting DRL descent control loop...")
+        print(f"[DescentLoop] Entered. mission_state={self.mission_state}", flush=True)
         last_processed_seq = -1
-        skipped_frames = 0
         last_wait_log = 0.0
+        first_frame = True
+        perception_gate_failure_since = None
 
         try:
             while self.mission_state not in ("LANDED", "ABORT", "EMERGENCY_STOP"):
                 loop_start = time.perf_counter()
+
+                # Flight-controller state is authoritative and must be checked
+                # before waiting on perception.  Leaving OFFBOARD is an
+                # intentional manual takeover, not an autonomous emergency.
+                if self.fc is not None and getattr(self.fc, "isOffboard", None) is False:
+                    logger.warning("[Pipeline] OFFBOARD exited; yielding to manual control")
+                    self._log_mission_event("MANUAL_TAKEOVER", reason="offboard_exited")
+                    self.mission_state = "IDLE"
+                    break
+                if self.fc is not None and getattr(self.fc, "isArmed", None) is False:
+                    logger.info("[Pipeline] Vehicle disarmed; ending control loop")
+                    self._log_mission_event("DISARMED", reason="px4_disarmed")
+                    self.mission_state = "LANDED"
+                    break
 
                 (
                     frame_points,
@@ -888,8 +1219,11 @@ class OrinLandingPipeline:
                     pose_seq,
                     sync_ms,
                 ) = self._grab_latest_snapshot()
+                cloud_stamp_ros_s = self.fastlio.points_stamp
                 if frame_points is None or frame_pose is None:
                     now = time.perf_counter()
+                    if perception_gate_failure_since is None:
+                        perception_gate_failure_since = now
                     if now - last_wait_log > 3.0:
                         logger.info(
                             "[Pipeline] Waiting for %s + %s...",
@@ -897,7 +1231,30 @@ class OrinLandingPipeline:
                             self.fastlio_odom_topic,
                         )
                         last_wait_log = now
-                    await self._send_zero_velocity(self.yaw_rate_cmd, now)
+                    if self._use_body_cloud and frame_points is not None:
+                        latest_px4 = np.array([
+                            *np.asarray(self.fc.uavPosENU, dtype=np.float32),
+                            float(getattr(self.fc, "uavRollENU", 0.0)),
+                            float(getattr(self.fc, "uavPitchENU", 0.0)),
+                            float(getattr(self.fc, "uavYawENU", 0.0)),
+                        ], dtype=np.float32)
+                        self._log_perception_gate(
+                            cloud_seq, pose_seq, None, latest_px4,
+                            "px4_cloud_sync", False, "no_px4_odom_within_sync_limit",
+                            frame_points,
+                        )
+                    await self._send_zero_velocity(0.0 if self._use_body_cloud else self.yaw_rate_cmd, now)
+                    if self._use_body_cloud and now - perception_gate_failure_since > 0.2:
+                        self._apply_state_decision(self.state_manager.reset(
+                            MissionState.HOLD_FOR_MANUAL,
+                            "body_cloud_or_px4_sync_timeout",
+                        ))
+                        self._log_mission_event(
+                            "MANUAL_TAKEOVER_REQUESTED",
+                            reason="body_cloud_or_px4_sync_timeout",
+                        )
+                        await self._hold_for_manual_takeover()
+                        break
                     await asyncio.sleep(0.02)
                     continue
 
@@ -911,7 +1268,21 @@ class OrinLandingPipeline:
                         cloud_seq,
                         pose_seq,
                     )
-                    await self._send_zero_velocity(self.yaw_rate_cmd, time.perf_counter())
+                    now = time.perf_counter()
+                    if perception_gate_failure_since is None:
+                        perception_gate_failure_since = now
+                    await self._send_zero_velocity(0.0 if self._use_body_cloud else self.yaw_rate_cmd, now)
+                    if self._use_body_cloud and now - perception_gate_failure_since > 0.2:
+                        self._apply_state_decision(self.state_manager.reset(
+                            MissionState.HOLD_FOR_MANUAL,
+                            "cloud_timestamp_missing",
+                        ))
+                        self._log_mission_event(
+                            "MANUAL_TAKEOVER_REQUESTED",
+                            reason="cloud_timestamp_missing",
+                        )
+                        await self._hold_for_manual_takeover()
+                        break
                     await asyncio.sleep(0.005)
                     continue
 
@@ -923,24 +1294,49 @@ class OrinLandingPipeline:
                         cloud_seq,
                         pose_seq,
                     )
-                    await self._send_zero_velocity(self.yaw_rate_cmd, time.perf_counter())
+                    now = time.perf_counter()
+                    if perception_gate_failure_since is None:
+                        perception_gate_failure_since = now
+                    self._log_perception_gate(
+                        cloud_seq, pose_seq, sync_ms, frame_pose,
+                        "px4_cloud_sync", False, "sync_limit_exceeded",
+                        frame_points,
+                    )
+                    await self._send_zero_velocity(0.0 if self._use_body_cloud else self.yaw_rate_cmd, now)
+                    if self._use_body_cloud and now - perception_gate_failure_since > 0.2:
+                        self._apply_state_decision(self.state_manager.reset(
+                            MissionState.HOLD_FOR_MANUAL,
+                            "px4_cloud_sync_timeout",
+                        ))
+                        self._log_mission_event(
+                            "MANUAL_TAKEOVER_REQUESTED",
+                            reason=f"px4_cloud_sync_timeout;sync_ms={sync_ms:.1f}",
+                        )
+                        await self._hold_for_manual_takeover()
+                        break
                     await asyncio.sleep(0.005)
                     continue
 
                 last_processed_seq = cloud_seq
+                perception_gate_failure_since = None
 
                 # --- 定位源健康评估 ---
-                now_ts = time.perf_counter()
+                # FAST-LIO stamps use the ROS clock. Never subtract them from
+                # time.perf_counter(), which has an unrelated process-local epoch.
+                now_ts = self._rospy.Time.now().to_sec() if self._rospy is not None else time.time()
                 health = self.pose_source_mgr.evaluate(
-                    fastlio_pose=frame_pose,
+                    # In outdoor body-cloud mode /ali_odom is diagnostic only.
+                    fastlio_pose=self.fastlio.pose if self._use_body_cloud else frame_pose,
                     fastlio_pose_stamp=self.fastlio.pose_stamp,
                     fastlio_points=frame_points,
                     fastlio_points_stamp=self.fastlio.points_stamp,
                     now=now_ts,
                 )
 
-                # 获取控制位姿 (可能从 FAST-LIO 或 MAVROS GPS fallback)
-                if health.control_pose_source.value == "gps_fallback":
+                # Outdoor body-cloud mode is PX4-authoritative by construction.
+                if self._use_body_cloud:
+                    control_pose = frame_pose
+                elif health.control_pose_source.value == "gps_fallback":
                     control_pose = np.array([
                         self.fc.uavPosNED[0], self.fc.uavPosNED[1], self.fc.uavPosNED[2],
                         self.fc.uavAngEular[0], self.fc.uavAngEular[1], self.fc.uavAngEular[2],
@@ -956,25 +1352,79 @@ class OrinLandingPipeline:
                 else:
                     control_pose = frame_pose
 
+                if self._use_body_cloud and not health.fastlio_cloud_healthy:
+                    await self._send_zero_velocity_logged(
+                        0.0, time.perf_counter(), state=self.mission_state,
+                        reason="body_cloud_unhealthy", pose_xyz=control_pose,
+                        sync_ms=sync_ms, fallback_reason=health.degraded_reason or "cloud_health",
+                    )
+                    self._log_perception_gate(
+                        cloud_seq, pose_seq, sync_ms, control_pose,
+                        "body_cloud_health", False, health.degraded_reason or "unhealthy",
+                        frame_points,
+                    )
+                    self._apply_state_decision(self.state_manager.reset(
+                        MissionState.HOLD_FOR_MANUAL,
+                        "body_cloud_unhealthy",
+                    ))
+                    self._log_mission_event(
+                        "MANUAL_TAKEOVER_REQUESTED",
+                        reason=health.degraded_reason or "body_cloud_unhealthy",
+                    )
+                    await self._hold_for_manual_takeover()
+                    break
+
+                # A large PX4 roll/pitch can invalidate the level-body ROI.
+                # down-looking ROI. Do not let such a geometrically invalid
+                # observation reach the policy; hold until the vehicle levels.
+                if max(abs(float(control_pose[3])), abs(float(control_pose[4]))) > self.max_roll_pitch_rad:
+                    await self._send_zero_velocity_logged(
+                        self.yaw_rate_cmd,
+                        time.perf_counter(),
+                        state=self.mission_state,
+                        reason="attitude_exceeds_perception_limit",
+                        pose_xyz=control_pose,
+                        sync_ms=sync_ms,
+                        fallback_reason="attitude_hold",
+                    )
+                    logger.warning(
+                        "[Pipeline] Attitude hold: roll=%.1fdeg pitch=%.1fdeg limit=%.1fdeg",
+                        math.degrees(float(control_pose[3])),
+                        math.degrees(float(control_pose[4])),
+                        math.degrees(self.max_roll_pitch_rad),
+                    )
+                    self.step_count += 1
+                    self._log_perception_gate(
+                        cloud_seq, pose_seq, sync_ms, control_pose,
+                        "px4_attitude", False, "attitude_exceeds_perception_limit",
+                        frame_points,
+                    )
+                    await asyncio.sleep(max(0.0, self.sim_dt - (time.perf_counter() - loop_start)))
+                    continue
+
                 # ---- 动态 FOV ROI: 根据当前对地高度计算半宽 ---- 
-                dyn_half, _, dyn_height = self._compute_roi_half_from_height(
+                dyn_half_x, dyn_half_y, dyn_height = self._compute_roi_half_from_height(
                     float(control_pose[2]), None,
                 )
-                self._roi_half_x = dyn_half
-                self._roi_half_y = dyn_half
+                self._roi_half_x = dyn_half_x
+                self._roi_half_y = dyn_half_y
 
-                # 感知输入始终使用 FAST-LIO 去畸变点云 (水平机体, 动态 ROI)
-                halss_points, halss_stats = world_to_level_body_roi(
-                    frame_points,
-                    control_pose[:3],
-                    control_pose[3:],
-                    self.cfg["perception"],
-                    half_x=dyn_half,
-                    half_y=dyn_half,
-                    )
+                # Outdoor uses the deskewed IMU/body cloud and PX4 roll/pitch;
+                # indoor retains the matched FAST-LIO world cloud/pose path.
+                t_p0 = time.perf_counter()
+                halss_points, projection_points, halss_stats = self._prepare_halss_points(
+                    frame_points, frame_pose, control_pose, dyn_half_x, dyn_half_y,
+                )
+                t_p1 = time.perf_counter()
+                self._log_perception_gate(
+                    cloud_seq, pose_seq, sync_ms, control_pose,
+                    "ready_for_inference", halss_stats["output_points"] >= 10,
+                    "ok" if halss_stats["output_points"] >= 10 else "roi_sparse",
+                    frame_points, halss_stats,
+                )
 
-                ground_p05 = self._pointcloud_ground_clearance(halss_points, 5.0)
-                ground_min = self._pointcloud_ground_clearance(halss_points, 0.0)
+                ground_p05 = self._pointcloud_ground_clearance(projection_points, 5.0)
+                ground_min = self._pointcloud_ground_clearance(projection_points, 0.0)
                 pose_xyz = tuple(float(x) for x in control_pose[:3])
                 pose_yaw = float(control_pose[5])
                 pose_height_m = self.state_manager.height_from_pose(pose_xyz)
@@ -984,11 +1434,19 @@ class OrinLandingPipeline:
                     pose_height_m is None
                     or pose_height_m <= max(0.3, self.state_manager.landed_height_m + 0.15)
                 )
+                if landed_state_on_ground:
+                    self._log_mission_event(
+                        "PX4_ON_GROUND", reason="mavros_extended_state_on_ground"
+                    )
                 state_inputs = StateInputs(
                     now=loop_start,
                     pose_xyz=pose_xyz,
                     yaw_rad=pose_yaw,
-                    velocity_xyz=tuple(float(x) for x in getattr(self.fc, "uavVelNED", np.zeros(3))[:3]),
+                    velocity_xyz=tuple(float(x) for x in getattr(
+                        self.fc,
+                        "uavVelENU" if self._use_body_cloud else "uavVelNED",
+                        np.zeros(3),
+                    )[:3]),
                     cloud_odom_sync_ms=sync_ms,
                     perception_ok=halss_stats["output_points"] >= 10,
                     landed_state_on_ground=landed_state_on_ground,
@@ -1002,8 +1460,26 @@ class OrinLandingPipeline:
                 state_decision = self.state_manager.update(state_inputs)
                 self._apply_state_decision(state_decision)
 
+                if first_frame:
+                    if self._use_body_cloud and self._halss_pinhole_ray_sampling:
+                        print(
+                            "[DescentLoop] Pinhole sampling: "
+                            f"cloud={halss_stats.get('input_points', 0)} "
+                            f"rect_roi={halss_stats.get('pre_ray_points', 0)} "
+                            f"frustum={halss_stats.get('frustum_points', 0)} "
+                            f"rays={halss_stats.get('output_points', 0)}/"
+                            f"{self._halss_ray_grid_res ** 2}",
+                            flush=True,
+                        )
+                    print(f"[DescentLoop] First frame: pose_z={pose_xyz[2]:.2f} height_m={pose_height_m} "
+                          f"state={state_decision.state.value} reason={state_decision.reason} "
+                          f"allow_drl={state_decision.allow_drl} direct_land={state_decision.direct_land} "
+                          f"landed={state_decision.landed} abort={state_decision.abort}",
+                          flush=True)
+                    first_frame = False
+
                 # --- MAVROS 安全 fallback: OFFBOARD 丢失或 disarm → ABORT ---
-                if self._fc_backend == "mavros" and self.fc is not None and self.fc.safety_fallback:
+                if self.fc is not None and self.fc.safety_fallback:
                     logger.error(
                         "[Pipeline] MAVROS safety fallback: %s → ABORT",
                         self.fc.safety_fallback_reason,
@@ -1014,7 +1490,7 @@ class OrinLandingPipeline:
                     break
 
                 # --- FAST-LIO 健康退化动作 ---
-                if health.degraded_action is not None:
+                if health.degraded_action is not None and not self._use_body_cloud:
                     degraded = health.degraded_action.value
                     if degraded == "abort":
                         logger.error(
@@ -1053,9 +1529,21 @@ class OrinLandingPipeline:
                         "[Pipeline] Target altitude reached: %.2fm",
                         float("nan") if state_decision.height_m is None else state_decision.height_m,
                     )
-                    yaw_deg = math.degrees(self._yaw_setpoint_rad or float(frame_pose[5]))
-                    await self.fc.send_velocity_ned_yaw(0.0, 0.0, 0.0, yaw_deg)
+                    if state_decision.reason == "px4_landed_state":
+                        self._log_mission_event(
+                            "PX4_ON_GROUND", reason="mavros_extended_state_on_ground"
+                        )
+                    await self.fc.send_velocity_enu_yaw_rate(0.0, 0.0, 0.0, 0.0)
                     await self.fc.disarm()
+                    for _ in range(40):
+                        if not bool(getattr(self.fc, "isArmed", True)):
+                            self._log_mission_event("DISARMED", reason="px4_disarm_confirmed")
+                            break
+                        await asyncio.sleep(0.05)
+                    else:
+                        logger.warning(
+                            "[MissionEvent] DISARMED not recorded: PX4 armed state did not clear"
+                        )
                     break
 
                 if not state_decision.allow_drl and not state_decision.direct_land:
@@ -1065,7 +1553,7 @@ class OrinLandingPipeline:
                             state_decision.reason,
                         )
                         break
-                    yaw_deg = await self._send_zero_velocity_logged(
+                    await self._send_zero_velocity_logged(
                         self.yaw_rate_cmd, time.perf_counter(),
                         state=state_decision.state.value,
                         reason=state_decision.reason,
@@ -1074,11 +1562,11 @@ class OrinLandingPipeline:
                         fallback_reason="fsm_hold",
                     )
                     logger.info(
-                        "[%04d] HOLD state=%s reason=%s yaw_sp=%.1fdeg",
+                        "[%04d] HOLD state=%s reason=%s yaw_rate_sp=%.2f",
                         self.step_count,
                         state_decision.state.value,
                         state_decision.reason,
-                        yaw_deg,
+                        self.yaw_rate_cmd,
                     )
                     self.step_count += 1
                     await asyncio.sleep(max(0.0, self.sim_dt - (time.perf_counter() - loop_start)))
@@ -1087,7 +1575,6 @@ class OrinLandingPipeline:
                 if state_decision.direct_land:
                     t_h0 = t_h1 = time.perf_counter()
                     sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
-                    safety_bev = None
                     binary_semantic_vis = make_binary_semantic_vis(
                         sem_map,
                         safe_id=self.safe_id,
@@ -1096,6 +1583,7 @@ class OrinLandingPipeline:
                     t_d0 = t_d1 = time.perf_counter()
                     sparse_depth = np.full((self.obs_h, self.obs_w), self.depth_max, dtype=np.float32)
                     valid_mask = np.zeros((self.obs_h, self.obs_w), dtype=bool)
+                    semantic_valid_mask = np.zeros((self.obs_h, self.obs_w), dtype=bool)
                     t_c0 = t_c1 = time.perf_counter()
                     rendered_depth = sparse_depth.copy()
                     action_id = 9
@@ -1116,10 +1604,11 @@ class OrinLandingPipeline:
                     if halss_stats["output_points"] < 10:
                         logger.warning(
                             "[Pipeline] HALSS level-body ROI sparse: roi=%d/%d "
-                            "half=%.1fm height=%.1fm z=[%.2f, %.2f]",
+                            "half=(%.1f,%.1f)m height=%.1fm z=[%.2f, %.2f]",
                             halss_stats["output_points"],
                             halss_stats["input_points"],
-                            dyn_half,
+                            dyn_half_x,
+                            dyn_half_y,
                             dyn_height,
                             halss_stats["z_min_body"],
                             halss_stats["z_max_body"],
@@ -1128,10 +1617,8 @@ class OrinLandingPipeline:
                     if halss_result is not None:
                         bev_data = halss_result.get("bev_data", halss_result)
                         sem_map = self.sem_gen.generate(bev_data)
-                        safety_bev = bev_data.get("safe_mesh")
                     else:
                         sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
-                        safety_bev = None
                     binary_semantic_vis = make_binary_semantic_vis(
                         sem_map,
                         safe_id=self.safe_id,
@@ -1139,15 +1626,33 @@ class OrinLandingPipeline:
                     )
 
                     t_d0 = time.perf_counter()
-                    sparse_depth, _ = project_bev_depth(
-                        halss_points,
-                        grid_res=int(self.cfg["perception"].get("halss_grid_res", 64)),
-                        out_size=self.obs_w,
-                        max_range=self.depth_max,
-                        half_x=self._roi_half_x,
-                        half_y=self._roi_half_y,
-                    )
-                    valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
+                    semantic_valid_mask = np.ones_like(sem_map, dtype=bool)
+                    if self._projection_mode == "training_camera":
+                        sparse_depth, valid_mask, sem_map, semantic_valid_mask = (
+                            project_training_camera(
+                                projection_points,
+                                sem_map,
+                                roi_bounds,
+                                self._training_camera,
+                                danger_id=self.danger_id,
+                            )
+                        )
+                        binary_semantic_vis = make_binary_semantic_vis(
+                            sem_map,
+                            safe_id=self.safe_id,
+                            danger_id=self.danger_id,
+                        )
+                        binary_semantic_vis[~semantic_valid_mask] = 128
+                    else:
+                        sparse_depth, _ = project_bev_depth(
+                            halss_points,
+                            grid_res=int(self.cfg["perception"].get("halss_grid_res", 64)),
+                            out_size=self.obs_w,
+                            max_range=self.depth_max,
+                            half_x=self._roi_half_x,
+                            half_y=self._roi_half_y,
+                        )
+                        valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
                     t_d1 = time.perf_counter()
 
                     t_c0 = time.perf_counter()
@@ -1156,12 +1661,18 @@ class OrinLandingPipeline:
 
                     t_r0 = time.perf_counter()
                     action_id, rl_info = self.drl.predict(rendered_depth, sem_map)
+                    rl_info["semantic_valid_ratio"] = float(np.mean(semantic_valid_mask))
                     t_r1 = time.perf_counter()
 
                     action_name = self.decomposer.action_id_to_name(action_id)
+                    execution_yaw_ned = (
+                        float(self.fc.uavAngEular[2])
+                        if self.execution_yaw_source == "px4_ekf"
+                        else float(frame_pose[5])
+                    )
                     v_body, v_ned, action_yaw_rate = self.decomposer.decompose(
                         action_id,
-                        float(frame_pose[5]),
+                        execution_yaw_ned,
                     )
 
                 if (
@@ -1176,86 +1687,103 @@ class OrinLandingPipeline:
                         self.state_manager.ground_crosscheck_max_error_m,
                     )
 
-                fresh_cloud_seq = self.fastlio.points_seq
-                if not state_decision.direct_land and fresh_cloud_seq > cloud_seq:
-                    skipped_frames += max(1, fresh_cloud_seq - cloud_seq)
-                    yaw_deg = await self._send_zero_velocity_logged(
-                        action_yaw_rate, time.perf_counter(),
-                        state=state_decision.state.value,
-                        reason=state_decision.reason,
-                        pose_xyz=frame_pose,
-                        sync_ms=sync_ms,
-                        fallback_reason="stale_inference_dropped",
-                    )
-                    if skipped_frames % 10 == 0:
-                        logger.info("[Pipeline] Dropped %d stale inferred frames total", skipped_frames)
-                    logger.info(
-                        "[%04d] STALE INFERENCE DROPPED cloud_seq=%d->%d pose_seq=%d "
-                        "yaw=%.1fdeg yaw_sp=%.1fdeg act=%d(%s)",
-                        self.step_count,
-                        cloud_seq,
-                        fresh_cloud_seq,
-                        pose_seq,
-                        math.degrees(float(frame_pose[5])),
-                        yaw_deg,
-                        action_id,
-                        action_name,
-                    )
-                    self.step_count += 1
-                    await asyncio.sleep(max(0.0, self.sim_dt - (time.perf_counter() - loop_start)))
-                    continue
-
                 pre_control_ms = (time.perf_counter() - loop_start) * 1000.0
-                slow_frame = pre_control_ms > self.max_frame_latency_ms
-                if slow_frame and self.drop_slow_frames and not state_decision.direct_land:
-                    yaw_deg = await self._send_zero_velocity_logged(
+                source_age_ms = max(0.0, float(health.cloud_age_ms or 0.0))
+                result_age_ms = source_age_ms + pre_control_ms
+                fresh_cloud_seq = self.fastlio.points_seq
+                newer_frames = max(0, fresh_cloud_seq - cloud_seq)
+                if newer_frames:
+                    logger.debug(
+                        "[%04d] inference result accepted with %d newer cloud frame(s): "
+                        "source=%d latest=%d age=%.0fms",
+                        self.step_count, newer_frames, cloud_seq, fresh_cloud_seq, result_age_ms,
+                    )
+                result_too_old = result_age_ms > self.max_inference_result_age_ms
+                if (result_too_old and self.drop_stale_frames and self.drop_slow_frames
+                        and not state_decision.direct_land):
+                    await self._send_zero_velocity_logged(
                         action_yaw_rate, time.perf_counter(),
                         state=state_decision.state.value,
                         reason=state_decision.reason,
                         pose_xyz=frame_pose,
                         sync_ms=sync_ms,
-                        fallback_reason="slow_frame_dropped",
+                        fallback_reason="inference_result_too_old",
                     )
                     self._record_timing(
                         t_h1 - t_h0, t_d1 - t_d0, t_c1 - t_c0,
-                        t_r1 - t_r0, 0.0, time.perf_counter() - loop_start
+                        t_r1 - t_r0, 0.0, time.perf_counter() - loop_start,
+                        cloud_stamp_ros_s=cloud_stamp_ros_s,
+                        cloud_seq=cloud_seq,
+                        pose_seq=pose_seq,
+                        state=state_decision.state.value,
+                        sync_ms=sync_ms,
+                        source_age_ms=source_age_ms,
+                        result_age_ms=result_age_ms,
+                        newer_frames=newer_frames,
+                        accepted=False,
+                        fallback_reason="inference_result_too_old",
+                        perception_executed=True,
+                        pointcloud_preprocess_s=t_p1 - t_p0,
                     )
                     logger.warning(
-                        "[%04d] SLOW FRAME DROPPED pre_ctrl=%.0fms budget=%.0fms "
-                        "cloud_seq=%d pose_seq=%d yaw=%.1fdeg yaw_sp=%.1fdeg act=%d(%s) v_ned=%s",
-                        self.step_count, pre_control_ms, self.max_frame_latency_ms,
-                        cloud_seq, pose_seq, math.degrees(float(frame_pose[5])), yaw_deg,
+                        "[%04d] INFERENCE RESULT TOO OLD age=%.0fms limit=%.0fms "
+                        "cloud_seq=%d pose_seq=%d yaw=%.1fdeg yaw_rate_sp=%.2f act=%d(%s) v_ned=%s",
+                        self.step_count, result_age_ms, self.max_inference_result_age_ms,
+                        cloud_seq, pose_seq, math.degrees(float(frame_pose[5])), action_yaw_rate,
                         action_id, action_name, _fmt_vec(v_ned),
                     )
                     if not state_decision.direct_land:
                         self._monitor_action_collapse(
                             action_id, action_name, rl_info, sparse_depth, valid_mask,
                             rendered_depth, sem_map, binary_semantic_vis, frame_pose,
-                            sync_ms, v_body, v_ned, cloud_seq, pose_seq
+                            sync_ms, v_body, v_ned, cloud_seq, pose_seq,
+                            semantic_valid_mask=semantic_valid_mask,
                         )
-                    self.visualizer.update(
-                        sem_map=sem_map,
-                        depth_map=rendered_depth,
-                        safety_bev=safety_bev,
-                        drone_pose=frame_pose,
-                        binary_semantic_vis=binary_semantic_vis,
-                    )
+                    try:
+                        self.visualizer.update(
+                            sem_map=sem_map,
+                            depth_map=rendered_depth,
+                            binary_semantic_vis=binary_semantic_vis,
+                        )
+                    except Exception:
+                        pass
                     self.step_count += 1
                     await asyncio.sleep(max(0.0, self.sim_dt - (time.perf_counter() - loop_start)))
                     continue
 
                 t_ctrl = time.perf_counter()
-                yaw_deg = self._advance_yaw_setpoint(action_yaw_rate, t_ctrl)
-                if state_decision.direct_land and state_decision.land_reference_xy_yaw is not None:
-                    pass
+                # ENU velocity + yaw_rate control
+                enu_vx, enu_vy, enu_vz = ned_to_enu_velocity(
+                    float(v_ned[0]), float(v_ned[1]), float(v_ned[2])
+                )
                 v_mavros_sp = np.zeros(3, dtype=np.float32)
-                if self._fc_backend == "mavros" and self.fc is not None:
-                    v_mavros_sp = await self.fc.send_velocity_body_or_ned_aligned_to_mavros(
-                        v_body, v_ned, yaw_deg,
-                    )
+                if state_decision.direct_land:
+                    # FAST-LIO world XY and MAVROS ENU XY are not guaranteed to
+                    # share an origin or axes. Lock landing XY in PX4's own ENU
+                    # frame at the moment DIRECT_LAND becomes active.
+                    if self._direct_land_enu_xy is None:
+                        px4_enu = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+                        self._direct_land_enu_xy = (float(px4_enu[0]), float(px4_enu[1]))
+                    lx, ly = self._direct_land_enu_xy
+                    await self.fc.send_landing_enu_yaw_rate(lx, ly, enu_vz, action_yaw_rate)
                 else:
-                    await self.fc.send_velocity_ned_yaw(v_ned[0], v_ned[1], v_ned[2], yaw_deg)
+                    self._direct_land_enu_xy = None
+                    await self._send_velocity_with_horizontal_hold(
+                        enu_vx, enu_vy, enu_vz, action_yaw_rate
+                    )
+                v_mavros_sp = np.array([enu_vx, enu_vy, enu_vz], dtype=np.float32)
                 t_ctrl_end = time.perf_counter()
+
+                # ---- real-time per-frame output (like test_live_nocontrol.py) ----
+                pos_str = f"pos=({control_pose[0]:.1f},{control_pose[1]:.1f},{control_pose[2]:.2f})"
+                v_str = f"v_enu=({enu_vx:+.2f},{enu_vy:+.2f},{enu_vz:+.2f})"
+                yaw_str = f"yaw={math.degrees(float(control_pose[5])):.0f}deg yr={action_yaw_rate:+.2f}"
+                lat_str = f"lat={(t_ctrl_end - loop_start)*1000:.0f}ms"
+                land_str = " [DIRECT_LAND]" if state_decision.direct_land else ""
+                print(
+                    f"\r[{self.step_count:04d}] ACT={action_id}({action_name}) {pos_str} {v_str} {yaw_str} {lat_str}{land_str}",
+                    end="", flush=True,
+                )
 
                 # --- velocity command CSV log ---
                 _fc_vel = getattr(self.fc, "uavVelNED", np.zeros(3, dtype=np.float32))
@@ -1271,17 +1799,19 @@ class OrinLandingPipeline:
                     v_ned=v_ned,
                     v_mavros_sp=v_mavros_sp,
                     fc_vel=_fc_vel,
-                    roll_deg=math.degrees(float(_att[0])),
-                    pitch_deg=math.degrees(float(_att[1])),
-                    yaw_deg=math.degrees(float(frame_pose[5])),
-                    yaw_setpoint_deg=yaw_deg,
+                    roll_deg=math.degrees(float(getattr(self.fc, "uavRollENU", _att[0]))),
+                    pitch_deg=math.degrees(float(getattr(self.fc, "uavPitchENU", _att[1]))),
+                    yaw_deg=math.degrees(float(getattr(self.fc, "uavYawENU", 0.0))),
+                    yaw_rate_setpoint_deg_s=math.degrees(action_yaw_rate),
                     height_m=float("nan") if state_decision.height_m is None else state_decision.height_m,
                     sync_ms=sync_ms,
                     direct_land=state_decision.direct_land,
                     fallback_reason="",
-                    health_ctrl=health.control_pose_source.value,
-                    health_cloud_src=health.perception_cloud_source.value,
-                    health_pose_ok="ok" if health.fastlio_pose_healthy else "degraded",
+                    health_ctrl="px4_ekf" if self._use_body_cloud else health.control_pose_source.value,
+                    health_cloud_src=("fastlio_deskewed_body" if self._use_body_cloud
+                                      else health.perception_cloud_source.value),
+                    health_pose_ok=("diagnostic" if self._use_body_cloud else
+                                    ("ok" if health.fastlio_pose_healthy else "degraded")),
                     health_cloud_ok="ok" if health.fastlio_cloud_healthy else "degraded",
                 )
 
@@ -1311,19 +1841,33 @@ class OrinLandingPipeline:
 
                 self._record_timing(
                     t_h1 - t_h0, t_d1 - t_d0, t_c1 - t_c0,
-                    t_r1 - t_r0, t_ctrl_end - t_ctrl, t_ctrl_end - loop_start
+                    t_r1 - t_r0, t_ctrl_end - t_ctrl, t_ctrl_end - loop_start,
+                    cloud_stamp_ros_s=cloud_stamp_ros_s,
+                    cloud_seq=cloud_seq,
+                    pose_seq=pose_seq,
+                    state=state_decision.state.value,
+                    sync_ms=sync_ms,
+                    source_age_ms=source_age_ms,
+                    result_age_ms=result_age_ms,
+                    newer_frames=newer_frames,
+                    accepted=True,
+                    fallback_reason="",
+                    perception_executed=not state_decision.direct_land,
+                    pointcloud_preprocess_s=t_p1 - t_p0,
                 )
 
-                self.visualizer.update(
-                    sem_map=sem_map,
-                    depth_map=rendered_depth,
-                    safety_bev=safety_bev,
-                    drone_pose=frame_pose,
-                    binary_semantic_vis=binary_semantic_vis,
-                )
+                try:
+                    self.visualizer.update(
+                        sem_map=sem_map,
+                        depth_map=rendered_depth,
+                        binary_semantic_vis=binary_semantic_vis,
+                    )
+                except Exception:
+                    pass
 
                 self._log_frame(
-                    action_id, action_name, frame_pose[5], yaw_deg, action_yaw_rate, sync_ms,
+                    action_id, action_name, frame_pose[5],
+                    math.degrees(float(frame_pose[5])), action_yaw_rate, sync_ms,
                     v_body, v_ned, rendered_depth, valid_mask, sem_map, rl_info,
                     cloud_seq, pose_seq, state_decision, health,
                 )
@@ -1331,7 +1875,8 @@ class OrinLandingPipeline:
                     self._monitor_action_collapse(
                         action_id, action_name, rl_info, sparse_depth, valid_mask,
                         rendered_depth, sem_map, binary_semantic_vis, frame_pose,
-                        sync_ms, v_body, v_ned, cloud_seq, pose_seq
+                        sync_ms, v_body, v_ned, cloud_seq, pose_seq,
+                        semantic_valid_mask=semantic_valid_mask,
                     )
 
                 self.step_count += 1
@@ -1352,94 +1897,328 @@ class OrinLandingPipeline:
     # Control helpers
     # ------------------------------------------------------------------
 
-    def _advance_yaw_setpoint(self, yaw_rate_rad_s: float, now: float) -> float:
-        if self._yaw_setpoint_rad is None:
-            mav_yaw = float(self.fc.uavAngEular[2]) if self.fc is not None else 0.0
-            self._yaw_setpoint_rad = mav_yaw
-            self._last_yaw_update_t = now
-        dt = self.sim_dt if self._last_yaw_update_t is None else max(0.0, now - self._last_yaw_update_t)
-        self._last_yaw_update_t = now
-        self._yaw_setpoint_rad = _wrap_pi(self._yaw_setpoint_rad + yaw_rate_rad_s * dt)
-        return math.degrees(self._yaw_setpoint_rad)
+    async def _send_zero_velocity(self, yaw_rate_rad_s: float, now: float) -> None:
+        """Hold a fixed PX4 ENU XY point instead of relying on zero velocity."""
+        await self._send_velocity_with_horizontal_hold(0.0, 0.0, 0.0, yaw_rate_rad_s)
 
-    async def _send_zero_velocity(self, yaw_rate_rad_s: float, now: float) -> float:
-        yaw_deg = self._advance_yaw_setpoint(yaw_rate_rad_s, now)
-        if self.fc is not None:
-            if self._fc_backend == "mavros":
-                await self.fc.send_zero_velocity_fallback(yaw_deg)
-            else:
-                await self.fc.send_velocity_ned_yaw(0.0, 0.0, 0.0, yaw_deg)
-        return yaw_deg
+    async def _send_velocity_with_horizontal_hold(
+        self, vx: float, vy: float, vz: float, yaw_rate_rad_s: float
+    ) -> None:
+        """Use position-XY feedback whenever the requested lateral speed is zero."""
+        if self.fc is None:
+            return
+        if math.hypot(float(vx), float(vy)) <= 1e-4:
+            if self._horizontal_hold_enu_xy is None:
+                pos = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+                self._horizontal_hold_enu_xy = (float(pos[0]), float(pos[1]))
+            hold_x, hold_y = self._horizontal_hold_enu_xy
+            await self.fc.send_landing_enu_yaw_rate(
+                hold_x, hold_y, float(vz), float(yaw_rate_rad_s)
+            )
+        else:
+            self._horizontal_hold_enu_xy = None
+            await self.fc.send_velocity_enu_yaw_rate(
+                float(vx), float(vy), float(vz), float(yaw_rate_rad_s)
+            )
 
     async def _send_zero_velocity_logged(
         self, yaw_rate_rad_s: float, now: float,
         state: str = "", reason: str = "",
         pose_xyz=None, sync_ms=None,
         fallback_reason: str = ""
-    ) -> float:
-        yaw_deg = self._advance_yaw_setpoint(yaw_rate_rad_s, now)
-        if self.fc is not None:
-            if self._fc_backend == "mavros":
-                await self.fc.send_zero_velocity_fallback(yaw_deg)
-            else:
-                await self.fc.send_velocity_ned_yaw(0.0, 0.0, 0.0, yaw_deg)
-        # Log zero-velocity fallback
+    ) -> None:
+        """Send fixed-XY hold + yaw_rate with CSV logging."""
+        await self._send_velocity_with_horizontal_hold(0.0, 0.0, 0.0, yaw_rate_rad_s)
+        # Log the fallback as zero commanded velocity; XY position fields are
+        # maintained internally by the MAVROS mixed position/velocity setpoint.
         _fc_vel = getattr(self.fc, "uavVelNED", np.zeros(3, dtype=np.float32)) if self.fc else np.zeros(3)
         _att = getattr(self.fc, "uavAngEular", np.zeros(3, dtype=np.float32)) if self.fc else np.zeros(3)
         _yaw = float(pose_xyz[5]) if pose_xyz is not None and len(pose_xyz) > 5 else float(_att[2])
+        if self._use_body_cloud and self.fc is not None:
+            height_pose = tuple(float(v) for v in self.fc.uavPosENU)
+        elif pose_xyz is not None:
+            height_pose = tuple(float(v) for v in pose_xyz[:3])
+        else:
+            height_pose = None
+        height_m = self.state_manager.height_from_pose(height_pose)
+        report = self.pose_source_mgr.get_current_report()
         self._log_velocity_command(
             step=self.step_count,
             timestamp_s=now,
             state=state,
             reason=reason,
             action_id=-1,
-            action_name="ZERO_FALLBACK",
+            action_name="XY_HOLD_FALLBACK",
             v_body=np.zeros(3, dtype=np.float32),
             v_ned=np.zeros(3, dtype=np.float32),
             v_mavros_sp=np.zeros(3, dtype=np.float32),
             fc_vel=_fc_vel,
-            roll_deg=math.degrees(float(_att[0])),
-            pitch_deg=math.degrees(float(_att[1])),
-            yaw_deg=math.degrees(_yaw),
-            yaw_setpoint_deg=yaw_deg,
-            height_m=0.0,
+            roll_deg=math.degrees(float(getattr(self.fc, "uavRollENU", _att[0]))),
+            pitch_deg=math.degrees(float(getattr(self.fc, "uavPitchENU", _att[1]))),
+            yaw_deg=math.degrees(float(getattr(self.fc, "uavYawENU", _yaw))),
+            yaw_rate_setpoint_deg_s=math.degrees(yaw_rate_rad_s),
+            height_m=float("nan") if height_m is None else height_m,
             sync_ms=sync_ms,
             direct_land=False,
             fallback_reason=fallback_reason,
+            health_ctrl="px4_ekf" if self._use_body_cloud else report.control_pose_source.value,
+            health_cloud_src=("fastlio_deskewed_body" if self._use_body_cloud
+                              else report.perception_cloud_source.value),
+            health_pose_ok="diagnostic" if self._use_body_cloud else (
+                "ok" if report.fastlio_pose_healthy else "degraded"
+            ),
+            health_cloud_ok="ok" if report.fastlio_cloud_healthy else "degraded",
         )
-        return yaw_deg
+
+    async def _warmup_perception(self) -> bool:
+        """Warm CUDA, then verify one fresh full inference meets the age budget.
+
+        The drone stays in position hold (last Phase 2 setpoint still active in background thread).
+        The cold pass is discarded.  A second, newer cloud must complete within
+        max_inference_result_age_ms or descent remains blocked.
+        """
+        warmup_start = time.perf_counter()
+        timeout_s = 15.0
+        cold_pass_cloud_seq = None
+
+        while time.perf_counter() - warmup_start < timeout_s:
+            frame_pts, frame_pose, cloud_seq, pose_seq, sync_ms = self._grab_latest_snapshot()
+            if self.fc is not None and (
+                getattr(self.fc, "isOffboard", None) is False
+                or getattr(self.fc, "isArmed", None) is False
+            ):
+                print("  Warmup cancelled: vehicle is not armed in OFFBOARD", flush=True)
+                return False
+            if frame_pts is None or frame_pose is None:
+                await asyncio.sleep(0.1)
+                continue
+            if sync_ms is None or sync_ms > self.max_cloud_odom_sync_ms:
+                await asyncio.sleep(0.05)
+                continue
+            if cold_pass_cloud_seq is not None and cloud_seq <= cold_pass_cloud_seq:
+                await asyncio.sleep(0.01)
+                continue
+
+            t0 = time.perf_counter()
+            try:
+                # Dynamic FOV ROI
+                dyn_half_x, dyn_half_y, _ = self._compute_roi_half_from_height(
+                    float(frame_pose[2]), None
+                )
+                roi_bounds = {
+                    "x_min": -dyn_half_x, "x_max": dyn_half_x,
+                    "y_min": -dyn_half_y, "y_max": dyn_half_y,
+                }
+
+                # HALSS
+                halss_pts, projection_pts, halss_stats = self._prepare_halss_points(
+                    frame_pts, frame_pose, frame_pose, dyn_half_x, dyn_half_y,
+                )
+                if int(halss_stats.get("output_points", 0)) < 10:
+                    await asyncio.sleep(0.05)
+                    continue
+                halss_result = self.halss.evaluate(halss_pts, fixed_bounds=roi_bounds)
+
+                # Semantic
+                if halss_result is not None:
+                    bev_data = halss_result.get("bev_data", halss_result)
+                    sem_map = self.sem_gen.generate(bev_data)
+                else:
+                    sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
+
+                # Depth
+                if self._projection_mode == "training_camera":
+                    sparse_depth, valid_mask, sem_map, _ = project_training_camera(
+                        projection_pts, sem_map, roi_bounds, self._training_camera,
+                        danger_id=self.danger_id,
+                    )
+                else:
+                    sparse_depth, _ = project_bev_depth(
+                        halss_pts,
+                        grid_res=int(self.cfg["perception"].get("halss_grid_res", 64)),
+                        out_size=self.obs_w, max_range=self.depth_max,
+                        half_x=dyn_half_x, half_y=dyn_half_y,
+                    )
+                    valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
+                rendered_depth = render_sparse_depth(sparse_depth, valid_mask, self.depth_max)
+
+                # DRL inference (the main warmup target)
+                action_id, _ = self.drl.predict(rendered_depth, sem_map)
+                action_name = self.decomposer.action_id_to_name(action_id)
+
+                dt = (time.perf_counter() - t0) * 1000
+                cloud_stamp = self.fastlio.points_stamp
+                result_age_ms = dt
+                if cloud_stamp is not None:
+                    result_age_ms = max(
+                        result_age_ms,
+                        (self._ros_time_now_s() - float(cloud_stamp)) * 1000.0,
+                    )
+                if cold_pass_cloud_seq is None:
+                    cold_pass_cloud_seq = cloud_seq
+                    print(
+                        f"  Warmup cold pass: act={action_id}({action_name}) "
+                        f"dt={dt:.0f}ms; validating on a fresh frame...",
+                        flush=True,
+                    )
+                    await asyncio.sleep(0.01)
+                    continue
+                if result_age_ms > self.max_inference_result_age_ms:
+                    print(
+                        f"  Warmup rejected: dt={dt:.0f}ms result_age={result_age_ms:.0f}ms exceeds "
+                        f"max_inference_result_age_ms={self.max_inference_result_age_ms:.0f}ms",
+                        flush=True,
+                    )
+                    return False
+                print(
+                    f"  Warmup validated: act={action_id}({action_name}) "
+                    f"dt={dt:.0f}ms result_age={result_age_ms:.0f}ms "
+                    f"<= {self.max_inference_result_age_ms:.0f}ms",
+                    flush=True,
+                )
+                return True
+            except Exception as e:
+                print(f"  Warmup error: {e}, retrying...", flush=True)
+                await asyncio.sleep(0.2)
+
+        print(f"  Warmup timeout after {timeout_s}s — requesting manual takeover", flush=True)
+        return False
+
+    async def _vertical_takeoff(self, target_altitude_m: float) -> bool:
+        """Move from the manual handoff point to launch-origin staging altitude.
+
+        1a. Velocity climb to target altitude
+        1b. Position hold + fixed-yaw stabilization
+        """
+        home_enu = self._home_enu
+        target_z = float(home_enu[2]) + target_altitude_m
+        # Do not reuse the policy's 10 m/s DESCEND action magnitude for takeoff.
+        # Mission guidance has its own conservative vertical-speed setting.
+        climb_speed = float(
+            self.cfg.get("global_prior", {}).get("takeoff_speed_z_ms", 1.0)
+        )
+        climb_timeout_s = float(self._goto_max_time_s)
+
+        logger.info("[Takeoff] Phase 1: climbing to %.1fm @ %.1f m/s (timeout=%.0fs)...",
+                   target_altitude_m, climb_speed, climb_timeout_s)
+        climb_start = time.perf_counter()
+        last_log = 0.0
+
+        # 1a. Proportional 3-D velocity, returning over the ground launch point.
+        while True:
+            current = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+            dx = float(home_enu[0] - current[0])
+            dy = float(home_enu[1] - current[1])
+            dz = float(target_z - current[2])
+            dist_xy = math.hypot(dx, dy)
+            if dist_xy <= self._goto_tolerance_xy and abs(dz) <= self._goto_tolerance_z:
+                logger.info("[Takeoff] Reached target altitude %.2fm in %.1fs",
+                           current[2] - float(home_enu[2]), time.perf_counter() - climb_start)
+                break
+            if time.perf_counter() - climb_start > climb_timeout_s:
+                logger.error("[Takeoff] Timeout %.0fs at height %.2fm XY error %.2fm",
+                             climb_timeout_s, current[2] - float(home_enu[2]), dist_xy)
+                break
+            vx, vy = _limited_xy_velocity(
+                dx, dy, self._goto_max_horizontal_speed_mps or 2.0,
+                self._goto_horizontal_kp_s,
+            )
+            vz = _limited_axis_velocity(dz, min(climb_speed, self._goto_max_vertical_speed_mps))
+            await self.fc.send_velocity_enu_yaw(vx, vy, vz, self._pre_goto_yaw_enu_deg)
+            now = time.perf_counter()
+            if now - last_log >= 1.0:
+                logger.info("[Takeoff] height=%.2fm target=%.1fm xy_error=%.2fm v=(%.2f,%.2f,%.2f) elapsed=%.1fs",
+                           current[2] - float(home_enu[2]), target_altitude_m, dist_xy,
+                           vx, vy, vz, now - climb_start)
+                last_log = now
+            await asyncio.sleep(0.05)
+
+        # 1b. Position hold + fixed-yaw stabilization
+        logger.info("[Takeoff] Stabilizing at %.1fm...", target_altitude_m)
+        for _ in range(20):  # ~2s
+            await self.fc.send_position_enu_yaw(
+                float(home_enu[0]), float(home_enu[1]), target_z,
+                self._pre_goto_yaw_enu_deg,
+            )
+            await asyncio.sleep(0.1)
+        logger.info("[Takeoff] Phase 1 complete.")
+        final = np.asarray(
+            self.fc.uavPosENU if hasattr(self.fc, "uavPosENU") else np.full(3, np.nan),
+            dtype=np.float64,
+        )
+        final_xy_error = float(np.linalg.norm(final[:2] - np.asarray(home_enu[:2])))
+        final_z_error = abs(float(final[2]) - target_z)
+        return bool(
+            np.isfinite(final).all()
+            and final_xy_error <= self._goto_tolerance_xy
+            and final_z_error <= self._goto_tolerance_z
+        )
 
     async def _goto_safe_point(self):
+        """Phase 2: Move to global safe point with position + yaw_rate control.
+
+        Outdoor profile uses capped ENU velocity XY plus position Z, so the
+        horizontal setpoint cannot exceed the configured limit. Profiles with
+        no limit retain the legacy full-position setpoint.
+        """
+        # Convert safe NED target to ENU
         if self._indoor_local_mode:
-            target = self._safe_ned_target
-            logger.info(
-                "[GOTO_SAFE] Indoor 3D target NED: n=%.2f e=%.2f d=%.2f "
-                "tol_xy=%.2fm tol_z=%.2fm speed_xy=%.2fm/s speed_z=%.2fm/s",
-                target[0], target[1], target[2],
-                self._goto_tolerance_xy, self._goto_tolerance_z,
-                self._goto_speed_xy, self._goto_speed_z,
-            )
+            target_ned = self._safe_ned_target
         else:
             if self._safe_ned is None:
                 self._safe_ned = self._gps_to_ned_offset_3d(
                     self._safe_lat, self._safe_lon, self._safe_altitude_m,
                 )
-            target = self._safe_ned
-            logger.info(
-                "[GOTO_SAFE] GPS 3D target NED: n=%.1f e=%.1f d=%.1f "
-                "tol_xy=%.1fm tol_z=%.1fm",
-                target[0], target[1], target[2],
-                self._goto_tolerance_xy, self._goto_tolerance_z,
+            target_ned = self._safe_ned
+
+        # NED → ENU: (north, east, down) → (east, north, up)
+        target_enu_x = float(target_ned[1])  # NED east → ENU x
+        target_enu_y = float(target_ned[0])  # NED north → ENU y
+        target_enu_z = float(-target_ned[2])  # NED down → ENU up (flip sign)
+
+        speed_text = (
+            "PX4 position control"
+            if self._goto_max_horizontal_speed_mps is None
+            else f"capped velocity XY <= {self._goto_max_horizontal_speed_mps:.2f}m/s"
+        )
+        logger.info(
+            "[GOTO_SAFE] Phase 2: ENU target (%.2f, %.2f, %.2f) "
+            "tol_xy=%.2fm tol_z=%.2fm mode=%s",
+            target_enu_x, target_enu_y, target_enu_z,
+            self._goto_tolerance_xy, self._goto_tolerance_z, speed_text,
+        )
+
+        # GOTO_SAFE is the deliberate yaw-fault start boundary. Seed the
+        # heartbeat before checking arrival.
+        current_enu = self.fc.uavPosENU if hasattr(self.fc, "uavPosENU") else np.zeros(3)
+        goto_vx = goto_vy = goto_vz = 0.0
+        if self._goto_max_horizontal_speed_mps is None:
+            await self.fc.send_position_enu_yaw_rate(
+                target_enu_x, target_enu_y, target_enu_z, self.yaw_rate_cmd
             )
+        else:
+            goto_vx, goto_vy = _limited_xy_velocity(
+                target_enu_x - float(current_enu[0]),
+                target_enu_y - float(current_enu[1]),
+                self._goto_max_horizontal_speed_mps,
+                self._goto_horizontal_kp_s,
+            )
+            goto_vz = _limited_axis_velocity(
+                target_enu_z - float(current_enu[2]), self._goto_max_vertical_speed_mps,
+                self._goto_horizontal_kp_s,
+            )
+            await self.fc.send_velocity_enu_yaw_rate(goto_vx, goto_vy, goto_vz, self.yaw_rate_cmd)
 
         goto_start = time.perf_counter()
         while self.mission_state == "GOTO_SAFE":
-            current = self.fc.uavPosNED
-            dx = target[0] - current[0]
-            dy = target[1] - current[1]
-            dz = target[2] - current[2]  # NED down: dz>0 means target is below
-            dist_xy = math.sqrt(dx * dx + dy * dy)
-            dist_z = abs(dz)
+            current_enu = self.fc.uavPosENU if hasattr(self.fc, 'uavPosENU') else np.zeros(3)
+            dist_xy = math.sqrt(
+                (target_enu_x - current_enu[0])**2 + (target_enu_y - current_enu[1])**2
+            )
+            dist_z = abs(target_enu_z - float(current_enu[2]))
+
+            if self.step_count % 5 == 0:  # log every 0.5s
+                print(f"\r  GOTO: dist_xy={dist_xy:.2f}m dist_z={dist_z:.2f}m cur=({current_enu[0]:.1f},{current_enu[1]:.1f},{current_enu[2]:.2f})", end="", flush=True)
 
             if dist_xy <= self._goto_tolerance_xy and dist_z <= self._goto_tolerance_z:
                 elapsed = time.perf_counter() - goto_start
@@ -1447,9 +2226,18 @@ class OrinLandingPipeline:
                     "[GOTO_SAFE] Arrived. XY error=%.2fm Z error=%.2fm time=%.1fs",
                     dist_xy, dist_z, elapsed,
                 )
+                # Replace the last velocity setpoint immediately. GPU warmup
+                # follows GOTO and must hold the reached safe point.
+                await self.fc.send_position_enu_yaw_rate(
+                    target_enu_x, target_enu_y, target_enu_z, self.yaw_rate_cmd
+                )
                 self._apply_state_decision(self.state_manager.mark_goto_arrived(
                     reason="goto_safe_arrived_local" if self._indoor_local_mode else "goto_safe_arrived"
                 ))
+                self._log_mission_event(
+                    "GOTO_ARRIVED",
+                    reason=f"xy_error_m={dist_xy:.3f};z_error_m={dist_z:.3f}",
+                )
                 break
 
             elapsed = time.perf_counter() - goto_start
@@ -1458,39 +2246,79 @@ class OrinLandingPipeline:
                     "[GOTO_SAFE] Timeout %.1fs > %.1fs. XY=%.2fm Z=%.2fm",
                     elapsed, self._goto_max_time_s, dist_xy, dist_z,
                 )
+                # Never leave a nonzero GOTO velocity active during timeout
+                # handling or the subsequent warmup/direct-land transition.
+                await self.fc.send_position_enu_yaw_rate(
+                    float(current_enu[0]), float(current_enu[1]), float(current_enu[2]),
+                    0.0,
+                )
                 if self._goto_timeout_action == "abort":
                     self.mission_state = "ABORT"
                     await self._emergency_stop()
                 else:
-                    self._apply_state_decision(self.state_manager.mark_goto_arrived(
-                        reason="goto_timeout_direct_land"
+                    self._apply_state_decision(self.state_manager.reset(
+                        state=MissionState.HOLD_FOR_MANUAL,
+                        reason="goto_timeout_wait_manual",
                     ))
+                    self._log_mission_event(
+                        "MANUAL_TAKEOVER_REQUESTED",
+                        reason=f"goto_timeout;xy_error_m={dist_xy:.3f};z_error_m={dist_z:.3f}",
+                    )
                 break
 
-            # 3D 速度引导: XY 和 Z 独立限速
-            speed_xy = min(self._goto_speed_xy, max(0.1, dist_xy))
-            vx = speed_xy * dx / max(dist_xy, 1e-6)
-            vy = speed_xy * dy / max(dist_xy, 1e-6)
-            # Z: NED down 为正
-            speed_z = min(self._goto_speed_z, max(0.05, dist_z))
-            vz = speed_z * (1.0 if dz > 0 else -1.0)  # positive=down
-            yaw_deg = self._advance_yaw_setpoint(self.yaw_rate_cmd, time.perf_counter())
-            if self._fc_backend == "mavros" and self.fc is not None:
-                await self.fc.send_velocity_body_or_ned_aligned_to_mavros(
-                    np.array([vx, vy, vz], dtype=np.float32),
-                    np.array([vx, vy, vz], dtype=np.float32),
-                    yaw_deg,
+            if self._goto_max_horizontal_speed_mps is None:
+                await self.fc.send_position_enu_yaw_rate(
+                    target_enu_x, target_enu_y, target_enu_z, self.yaw_rate_cmd
                 )
             else:
-                await self.fc.send_velocity_ned_yaw(vx, vy, vz, yaw_deg)
+                goto_vx, goto_vy = _limited_xy_velocity(
+                    target_enu_x - float(current_enu[0]),
+                    target_enu_y - float(current_enu[1]),
+                    self._goto_max_horizontal_speed_mps,
+                    self._goto_horizontal_kp_s,
+                )
+                goto_vz = _limited_axis_velocity(
+                    target_enu_z - float(current_enu[2]), self._goto_max_vertical_speed_mps,
+                    self._goto_horizontal_kp_s,
+                )
+                await self.fc.send_velocity_enu_yaw_rate(
+                    goto_vx, goto_vy, goto_vz, self.yaw_rate_cmd
+                )
 
             if self.step_count % 10 == 0:
                 logger.info(
-                    "[GOTO_SAFE] XY=%.2fm Z=%.2fm v_ned=(%.2f,%.2f,%.2f) yaw_sp=%.1fdeg elapsed=%.1fs",
-                    dist_xy, dist_z, vx, vy, vz, yaw_deg, elapsed,
+                    "[GOTO_SAFE] XY=%.2fm Z=%.2fm target=(%.2f,%.2f,%.2f) "
+                    "vel_sp=(%.2f,%.2f,%.2f)m/s yaw_rate=%.2f elapsed=%.1fs",
+                    dist_xy, dist_z, target_enu_x, target_enu_y, target_enu_z,
+                    goto_vx, goto_vy, goto_vz, self.yaw_rate_cmd, elapsed,
                 )
             self.step_count += 1
             await asyncio.sleep(0.1)
+
+    async def _hold_for_manual_takeover(self):
+        """Hold the current PX4 pose until the pilot exits OFFBOARD or disarms."""
+        hold = np.asarray(self.fc.uavPosENU, dtype=np.float32).copy()
+        yaw_deg = math.degrees(float(self.fc.uavYawENU))
+        logger.warning(
+            "[ManualHold] Holding ENU=%s yaw=%.1fdeg; pilot must switch out of OFFBOARD",
+            _fmt_vec(hold), yaw_deg,
+        )
+        last_notice = 0.0
+        while bool(getattr(self.fc, "isArmed", False)) and bool(getattr(self.fc, "isOffboard", False)):
+            await self.fc.send_position_enu_yaw(
+                float(hold[0]), float(hold[1]), float(hold[2]), yaw_deg,
+            )
+            now = time.perf_counter()
+            if now - last_notice >= 1.0:
+                logger.warning("[ManualHold] Waiting for pilot takeover; OFFBOARD remains active")
+                last_notice = now
+            await asyncio.sleep(0.1)
+        if not bool(getattr(self.fc, "isOffboard", False)):
+            self.mission_state = "IDLE"
+            self._log_mission_event("MANUAL_TAKEOVER", reason="pilot_exited_offboard")
+        else:
+            self.mission_state = "LANDED"
+            self._log_mission_event("DISARMED", reason="disarmed_during_manual_hold")
 
     def _compute_local_ned_target_3d(self, home_ned: np.ndarray, home_yaw_rad: float) -> np.ndarray:
         """Convert 3D body-frame offset to local NED target.
@@ -1521,7 +2349,11 @@ class OrinLandingPipeline:
         dn = (lat - home_lat) * meters_per_deg_lat
         de = (lon - home_lon) * meters_per_deg_lon
         dd = self._home_ned[2] - alt_m  # NED down: alt_m 高于起飞点 → dd < home_ned[2]
-        return np.array([dn, de, dd], dtype=np.float32)
+        return np.array([
+            float(self._home_ned[0]) + dn,
+            float(self._home_ned[1]) + de,
+            dd,
+        ], dtype=np.float32)
 
     def _compute_local_ned_target(self, home_ned: np.ndarray, home_yaw_rad: float) -> np.ndarray:
         """[DEPRECATED] 2D body-frame offset → NED target. Use _compute_local_ned_target_3d instead."""
@@ -1529,10 +2361,10 @@ class OrinLandingPipeline:
 
     def _gps_to_ned_offset(self, lat: float, lon: float) -> np.ndarray:
         """[DEPRECATED] Use _gps_to_ned_offset_3d instead."""
-        return self._gps_to_ned_offset_3d(lat, lon, self._safe_altitude_m or 2.0)
+        return self._gps_to_ned_offset_3d(lat, lon, self._safe_altitude_m or 0.0)
 
     def _gps_to_ned_distance(self, lat: float, lon: float) -> float:
-        target = self._gps_to_ned_offset_3d(lat, lon, self._safe_altitude_m or 2.0)
+        target = self._gps_to_ned_offset_3d(lat, lon, self._safe_altitude_m or 0.0)
         return float(np.linalg.norm(target[:2]))
 
     # ------------------------------------------------------------------
@@ -1542,21 +2374,67 @@ class OrinLandingPipeline:
     def _grab_latest_snapshot(self):
         """Return one immutable FAST-LIO cloud/pose snapshot for one control decision."""
         pts = self.fastlio.points
-        pose = self.fastlio.pose
         cloud_seq = self.fastlio.points_seq
         pose_seq = self.fastlio.pose_seq
+        if pts is None:
+            return None, None, -1, -1, None
+        if self._use_body_cloud:
+            if self.fc is None or self.fastlio.points_stamp is None:
+                return pts.copy(), None, cloud_seq, pose_seq, None
+            sample = self.fc.get_odom_nearest(
+                self.fastlio.points_stamp,
+                max_delta_ms=self.max_cloud_odom_sync_ms,
+            )
+            if sample is None:
+                return pts.copy(), None, cloud_seq, pose_seq, None
+            pos = sample["position_enu"]
+            pose = np.array([
+                pos[0], pos[1], pos[2],
+                sample["roll"], sample["pitch"],
+                # Action decomposition explicitly uses PX4 NED yaw later; this
+                # field remains ENU yaw for logging and local geometry only.
+                sample["yaw_enu"],
+            ], dtype=np.float32)
+            return pts.copy(), pose, cloud_seq, pose_seq, float(sample["sync_ms"])
+        pose = self.fastlio.pose
         sync_ms = self.fastlio.sync_delta_ms
-        if pts is None or pose is None:
+        if pose is None:
             return None, None, -1, -1, None
         return pts.copy(), pose.copy(), cloud_seq, pose_seq, sync_ms
 
-    def _record_timing(self, halss, depth, completion, rl, control, total):
+    def _record_timing(
+        self, halss, depth, completion, rl, control, total, *,
+        cloud_stamp_ros_s=None, cloud_seq=-1, pose_seq=-1, state="",
+        sync_ms=None, source_age_ms=None, result_age_ms=None, newer_frames=0,
+        accepted=True, fallback_reason="", perception_executed=False,
+        pointcloud_preprocess_s=0.0,
+    ):
         self._timing["halss"].append(halss * 1000.0)
         self._timing["depth"].append(depth * 1000.0)
         self._timing["completion"].append(completion * 1000.0)
         self._timing["rl"].append(rl * 1000.0)
         self._timing["control"].append(control * 1000.0)
         self._timing["total"].append(total * 1000.0)
+        if perception_executed:
+            self._log_frame_timing(
+                cloud_stamp_ros_s=cloud_stamp_ros_s,
+                cloud_seq=cloud_seq,
+                pose_seq=pose_seq,
+                state=state,
+                sync_ms=sync_ms,
+                pointcloud_preprocess_ms=pointcloud_preprocess_s * 1000.0,
+                halss_ms=halss * 1000.0,
+                depth_ms=depth * 1000.0,
+                completion_ms=completion * 1000.0,
+                onnx_ms=rl * 1000.0,
+                control_ms=control * 1000.0,
+                pipeline_total_ms=total * 1000.0,
+                source_age_ms=source_age_ms,
+                result_age_ms=result_age_ms,
+                newer_frames=newer_frames,
+                accepted=accepted,
+                fallback_reason=fallback_reason,
+            )
 
     def _apply_state_decision(self, decision):
         self.mission_state = decision.state.value
@@ -1573,6 +2451,47 @@ class OrinLandingPipeline:
                     else f"{decision.ground_clearance_p05_m:.2f}m"
                 ),
             )
+            if decision.state.value == "DRL_DESCENT":
+                self._log_mission_event("DRL_DESCENT_STARTED", reason=decision.reason)
+            elif decision.state.value == "DIRECT_LAND":
+                self._log_mission_event("DIRECT_LAND_STARTED", reason=decision.reason)
+
+    def _prepare_halss_points(self, frame_points, frame_pose, control_pose,
+                              half_x: float, half_y: float):
+        """Prepare bounded HALSS input while retaining full points for depth.
+
+        Outdoor body-cloud mode first performs the existing rigid transform and
+        level-body ROI, then optionally keeps the nearest observed point in each
+        fixed pinhole ray.  The full ROI remains available to the 128x128 depth
+        z-buffer so HALSS acceleration does not unnecessarily reduce depth
+        coverage.  Indoor world-cloud behavior is unchanged.
+        """
+        if not self._use_body_cloud:
+            points, stats = world_to_level_body_roi(
+                frame_points, frame_pose[:3], frame_pose[3:],
+                self.cfg["perception"], half_x=half_x, half_y=half_y,
+            )
+            return points, points, stats
+
+        projection_points, stats = body_cloud_to_level_body_roi(
+            frame_points,
+            float(control_pose[3]), float(control_pose[4]),
+            self.cfg["perception"], half_x=half_x, half_y=half_y,
+        )
+        if not self._halss_pinhole_ray_sampling:
+            return projection_points, projection_points, stats
+
+        halss_points, ray_stats = sample_nearest_points_by_camera_rays(
+            projection_points,
+            self._training_camera,
+            ray_width=self._halss_ray_grid_res,
+            ray_height=self._halss_ray_grid_res,
+        )
+        stats["pre_ray_points"] = int(len(projection_points))
+        stats["frustum_points"] = int(ray_stats["frustum_points"])
+        stats["ray_grid"] = [self._halss_ray_grid_res, self._halss_ray_grid_res]
+        stats["output_points"] = int(len(halss_points))
+        return halss_points, projection_points, stats
 
     def _roi_bounds(self) -> dict:
         """Return the current (possibly dynamic) ROI bounds for HALSS / depth."""
@@ -1585,7 +2504,8 @@ class OrinLandingPipeline:
                                        halss_points: np.ndarray = None) -> tuple:
         """Compute dynamic ROI half-extent from current height above ground.
 
-        Simulates a fixed-FOV depth camera: half = H * tan(fov_half).
+        training_camera uses the original renderer's rectangular FOV. Legacy
+        BEV uses half = H * tan(fov_half).
         Returns (half_x, half_y, height_m).
         """
         if not self._roi_dynamic:
@@ -1600,6 +2520,11 @@ class OrinLandingPipeline:
             H = abs(float(pose_z_world) - self._ground_z_world)
 
         H = max(H, 0.1)
+        if self._projection_mode == "training_camera":
+            half_x, half_y = self._training_camera.ground_half_extents(H)
+            half_x = max(self._roi_min_half_m, min(self._roi_max_half_m, half_x))
+            half_y = max(self._roi_min_half_m, min(self._roi_max_half_m, half_y))
+            return half_x, half_y, H
         half = H * math.tan(self._roi_fov_half_rad)
         half_clamped = max(self._roi_min_half_m, min(self._roi_max_half_m, half))
         return half_clamped, half_clamped, H
@@ -1621,18 +2546,20 @@ class OrinLandingPipeline:
     def _direct_land_rl_info(self, depth_map, sem_map):
         depth = np.nan_to_num(depth_map, nan=self.depth_max, posinf=self.depth_max, neginf=0.0)
         sem_safe = sem_map == self.safe_id
+        depth_norm = np.clip(depth, 0.0, self.depth_max) / 255.0
+        sem_norm = np.where(sem_safe, 30.0, 250.0) / 255.0
         probs = [0.0] * len(self.decomposer.action_names)
         if len(probs) > 9:
             probs[9] = 1.0
         return {
             "confidence": 1.0,
             "action_probs": probs,
-            "depth_norm_min": float(np.min(depth)),
-            "depth_norm_mean": float(np.mean(depth)),
-            "depth_norm_max": float(np.max(depth)),
-            "sem_norm_min": 30.0 if np.any(sem_safe) else 250.0,
-            "sem_norm_mean": float(np.mean(np.where(sem_safe, 30.0, 250.0))),
-            "sem_norm_max": 250.0,
+            "depth_norm_min": float(np.min(depth_norm)),
+            "depth_norm_mean": float(np.mean(depth_norm)),
+            "depth_norm_max": float(np.max(depth_norm)),
+            "sem_norm_min": float(np.min(sem_norm)),
+            "sem_norm_mean": float(np.mean(sem_norm)),
+            "sem_norm_max": float(np.max(sem_norm)),
             "direct_land_override": True,
         }
 
@@ -1695,7 +2622,10 @@ class OrinLandingPipeline:
 
     def _monitor_action_collapse(self, action_id, action_name, rl_info, sparse_depth,
                                  valid_mask, dense_depth, sem_map, binary_semantic_vis,
-                                 pose, sync_ms, v_body, v_ned, cloud_seq, pose_seq):
+                                 pose, sync_ms, v_body, v_ned, cloud_seq, pose_seq,
+                                 semantic_valid_mask=None):
+        if semantic_valid_mask is None:
+            semantic_valid_mask = np.ones_like(sem_map, dtype=bool)
         self.action_monitor.observe(
             self.step_count,
             action_id,
@@ -1704,6 +2634,7 @@ class OrinLandingPipeline:
             {
                 "sparse_depth": sparse_depth.astype(np.float32),
                 "valid_mask": valid_mask.astype(np.uint8),
+                "semantic_valid_mask": semantic_valid_mask.astype(np.uint8),
                 "dense_depth": dense_depth.astype(np.float32),
                 "sem_map": sem_map.astype(np.uint8),
                 "binary_semantic_vis": (
@@ -1736,17 +2667,15 @@ class OrinLandingPipeline:
     async def _shutdown(self):
         logger.info("[Pipeline] Shutting down...")
         try:
-            yaw_deg = math.degrees(self._yaw_setpoint_rad or 0.0)
-            if self._fc_backend == "mavros" and self.fc is not None:
-                await self.fc.send_zero_velocity_fallback(yaw_deg)
-            elif self.fc is not None:
-                await self.fc.send_velocity_ned_yaw(0.0, 0.0, 0.0, yaw_deg)
+            if self.fc is not None:
+                await self.fc.send_velocity_enu_yaw_rate(0.0, 0.0, 0.0, 0.0)
         except Exception:
             pass
         self.visualizer.close()
         await self._stop_recording()
         self._close_velocity_log()
         self._close_drl_action_log()
+        self._close_experiment_logs()
         if self._rospy is not None:
             self._rospy.signal_shutdown("orin landing pipeline stopped")
         logger.info("[Pipeline] Shutdown complete.")
@@ -1761,6 +2690,9 @@ class OrinLandingPipeline:
 
     def _setup_run_dir(self):
         """Create experiment run directory and initialize log files."""
+        if self._run_dir is not None:
+            logger.debug("[RunDir] Reusing existing run directory %s", self._run_dir)
+            return
         import csv
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         self._run_dir = Path("experiments/runs") / f"{timestamp}_orin_landing"
@@ -1772,17 +2704,25 @@ class OrinLandingPipeline:
         self._vel_log_file = open(str(self._vel_log_path), "w", newline="")
         self._vel_log_writer = csv.writer(self._vel_log_file)
         self._vel_log_writer.writerow([
-            "step", "timestamp_s", "state", "reason",
+            "step", "timestamp_ros_s", "state", "reason",
             "action_id", "action_name",
+            "enu_x", "enu_y", "enu_z",
             "v_body_x", "v_body_y", "v_body_z",
             "v_ned_x", "v_ned_y", "v_ned_z",
             "v_mavros_x", "v_mavros_y", "v_mavros_z",
             "fc_vel_x", "fc_vel_y", "fc_vel_z",
             "roll_deg", "pitch_deg", "yaw_deg",
-            "yaw_setpoint_deg", "height_m",
+            "yaw_rate_cmd_rad_s", "yaw_rate_setpoint_deg_s",
+            "yaw_rate_measured_rad_s", "yaw_rate_measured_source",
+            "hold_enu_x", "hold_enu_y", "xy_hold_active",
+            "setpoint_type_mask", "setpoint_age_ms", "setpoint_publish_rate_hz",
+            "height_m",
             "sync_ms", "direct_land", "fallback_reason",
             "control_pose_source", "perception_cloud_source",
             "fastlio_pose_healthy", "fastlio_cloud_healthy",
+            "fastlio_x", "fastlio_y", "fastlio_z",
+            "fastlio_roll_deg", "fastlio_pitch_deg", "fastlio_yaw_deg",
+            "height_source",
         ])
         self._vel_log_file.flush()
 
@@ -1791,7 +2731,7 @@ class OrinLandingPipeline:
         self._drl_log_file = open(str(self._drl_log_path), "w", newline="")
         self._drl_log_writer = csv.writer(self._drl_log_file)
         self._drl_log_writer.writerow([
-            "step", "cloud_seq", "pose_seq", "sync_ms",
+            "step", "timestamp_ros_s", "cloud_seq", "pose_seq", "sync_ms",
             "pose_x", "pose_y", "pose_z", "yaw_rad",
             "roi_points", "roi_z_min", "roi_z_max",
             "depth_min", "depth_mean", "depth_max",
@@ -1803,6 +2743,51 @@ class OrinLandingPipeline:
         ])
         self._drl_log_file.flush()
         logger.info("[RunDir] Logs: %s, %s", self._vel_log_path, self._drl_log_path)
+
+        # Mission phase boundaries. ROS time is used for alignment with rosbag;
+        # monotonic time is retained for robust same-process duration checks.
+        self._event_log_path = self._run_dir / "mission_events.csv"
+        self._event_log_file = open(str(self._event_log_path), "w", newline="")
+        self._event_log_writer = csv.writer(self._event_log_file)
+        self._event_log_writer.writerow([
+            "event", "timestamp_ros_s", "monotonic_s", "mission_state", "reason",
+            "enu_x", "enu_y", "enu_z", "fastlio_x", "fastlio_y", "fastlio_z",
+            "height_m", "armed", "offboard", "px4_on_ground",
+        ])
+        self._event_log_file.flush()
+
+        # One row per actual cloud perception/inference attempt. Warmup and
+        # DIRECT_LAND placeholder frames are deliberately excluded.
+        self._frame_timing_path = self._run_dir / "frame_timing.csv"
+        self._frame_timing_file = open(str(self._frame_timing_path), "w", newline="")
+        self._frame_timing_writer = csv.writer(self._frame_timing_file)
+        self._frame_timing_writer.writerow([
+            "timestamp_ros_s", "cloud_stamp_ros_s", "cloud_seq", "pose_seq", "state",
+            "sync_ms", "pointcloud_preprocess_ms", "halss_ms", "depth_projection_ms",
+            "depth_completion_ms", "onnx_ms", "perception_inference_ms", "control_ms",
+            "pipeline_total_ms",
+            "source_age_ms", "result_age_ms", "newer_frames", "accepted",
+            "fallback_reason",
+        ])
+        self._frame_timing_file.flush()
+
+        self._perception_gate_path = self._run_dir / "perception_gate_log.csv"
+        self._perception_gate_file = open(str(self._perception_gate_path), "w", newline="")
+        self._perception_gate_writer = csv.writer(self._perception_gate_file)
+        self._perception_gate_writer.writerow([
+            "timestamp_ros_s", "cloud_stamp_ros_s", "cloud_seq", "pose_seq",
+            "cloud_px4_sync_ms", "cloud_points", "finite_ratio", "roi_points",
+            "px4_x", "px4_y", "px4_z", "px4_roll_deg", "px4_pitch_deg", "px4_yaw_deg",
+            "fastlio_x", "fastlio_y", "fastlio_z",
+            "fastlio_roll_deg", "fastlio_pitch_deg", "fastlio_yaw_deg",
+            "gate_stage", "accepted", "reason", "cloud_source",
+        ])
+        self._perception_gate_file.flush()
+        logger.info(
+            "[RunDir] Timeline: %s; frame timing: %s",
+            self._event_log_path,
+            self._frame_timing_path,
+        )
 
         # Config snapshot
         self._save_config_snapshot()
@@ -1832,15 +2817,26 @@ class OrinLandingPipeline:
             "halss_weight_sha256": self._file_sha256(
                 self.cfg.get("perception", {}).get("halss_weight_path", "")
             ),
-            "roi_type": "level_body_fixed_10x10",
-            "roi_x_range": [-5.0, 5.0],
-            "roi_y_range": [-5.0, 5.0],
+            "roi_type": "level_body_dynamic_fov" if self._roi_dynamic else "level_body_fixed",
+            "roi_fov_half_deg": math.degrees(self._roi_fov_half_rad),
+            "roi_half_min_m": self._roi_min_half_m,
+            "roi_half_max_m": self._roi_max_half_m,
             "dmax": self.depth_max,
             "obs_size": [self.obs_h, self.obs_w],
             "yaw_rate_rad_s": self.yaw_rate_cmd,
             "sim_dt": self.sim_dt,
             "fc_backend": self._fc_backend,
             "fc_mavros_ns": self._mavros_ns,
+            "localization_mode": self.localization_mode,
+            "px4_position_source": self.px4_position_source,
+            "external_pose_topic": self.external_pose_topic,
+            "perception_cloud_topic": self.fastlio_cloud_topic,
+            "perception_cloud_frame": "lidar_imu_body" if self._use_body_cloud else "fastlio_world",
+            "control_pose_source": "px4_ekf" if self._use_body_cloud else "fastlio_or_fallback",
+            "height_source": self.state_manager.height_source,
+            "goto_max_horizontal_speed_mps": self._goto_max_horizontal_speed_mps,
+            "goto_max_vertical_speed_mps": self._goto_max_vertical_speed_mps,
+            "rosbag_topics": self.cfg.get("experiment_recording", {}).get("bag_topics", []),
             "git_summary": self._git_summary(),
         }
         # Add CLI overrides from config_overrides if available
@@ -1896,7 +2892,7 @@ class OrinLandingPipeline:
         action_id: int, action_name: str,
         v_body, v_ned, v_mavros_sp, fc_vel,
         roll_deg: float, pitch_deg: float, yaw_deg: float,
-        yaw_setpoint_deg: float, height_m: float,
+        yaw_rate_setpoint_deg_s: float, height_m: float,
         sync_ms: float, direct_land: bool, fallback_reason: str = "",
         health_ctrl: str = "", health_cloud_src: str = "",
         health_pose_ok: str = "", health_cloud_ok: str = "",
@@ -1904,24 +2900,59 @@ class OrinLandingPipeline:
         if self._vel_log_writer is None:
             return
         try:
+            timestamp_s = (
+                self._rospy.Time.now().to_sec()
+                if self._rospy is not None else time.time()
+            )
             v_body = np.asarray(v_body, dtype=np.float32).ravel()
             v_ned = np.asarray(v_ned, dtype=np.float32).ravel()
             v_mavros_sp = np.asarray(v_mavros_sp, dtype=np.float32).ravel()
             fc_vel = np.asarray(fc_vel, dtype=np.float32).ravel()
+            enu_pos = np.asarray(
+                getattr(self.fc, "uavPosENU", np.zeros(3)), dtype=np.float32
+            ).ravel()
+            yaw_rate_measured = float(getattr(self.fc, "uavYawRateENU", float("nan")))
+            sp_status = self.fc.get_setpoint_status() if self.fc is not None else {}
+            updated = sp_status.get("updated_monotonic_s")
+            sp_age_ms = (
+                float("nan") if updated is None
+                else max(0.0, (time.perf_counter() - float(updated)) * 1000.0)
+            )
+            hold = self._horizontal_hold_enu_xy
+            fastlio_pose = np.asarray(
+                getattr(self.fastlio, "pose", np.full(6, np.nan)), dtype=np.float64
+            ).ravel()
+            fastlio_pose = np.pad(
+                fastlio_pose, (0, max(0, 6 - fastlio_pose.size)), constant_values=np.nan
+            )
+            fastlio_rpy_deg = np.degrees(fastlio_pose[3:6])
             self._vel_log_writer.writerow([
                 step, f"{timestamp_s:.6f}", state, reason,
                 action_id, action_name,
+                f"{enu_pos[0]:.4f}", f"{enu_pos[1]:.4f}", f"{enu_pos[2]:.4f}",
                 f"{v_body[0]:.4f}", f"{v_body[1]:.4f}", f"{v_body[2]:.4f}",
                 f"{v_ned[0]:.4f}", f"{v_ned[1]:.4f}", f"{v_ned[2]:.4f}",
                 f"{v_mavros_sp[0]:.4f}", f"{v_mavros_sp[1]:.4f}", f"{v_mavros_sp[2]:.4f}",
                 f"{fc_vel[0]:.4f}", f"{fc_vel[1]:.4f}", f"{fc_vel[2]:.4f}",
                 f"{roll_deg:.2f}", f"{pitch_deg:.2f}", f"{yaw_deg:.2f}",
-                f"{yaw_setpoint_deg:.2f}", f"{height_m:.3f}",
+                f"{math.radians(yaw_rate_setpoint_deg_s):.6f}",
+                f"{yaw_rate_setpoint_deg_s:.2f}",
+                f"{yaw_rate_measured:.6f}", "mavros_local_odom.twist.angular.z",
+                "n/a" if hold is None else f"{hold[0]:.4f}",
+                "n/a" if hold is None else f"{hold[1]:.4f}",
+                "0" if hold is None else "1",
+                sp_status.get("type_mask", "n/a"),
+                "n/a" if not np.isfinite(sp_age_ms) else f"{sp_age_ms:.1f}",
+                f"{float(sp_status.get('publish_rate_hz', 0.0)):.2f}",
+                f"{height_m:.3f}",
                 f"{sync_ms:.1f}" if sync_ms is not None else "n/a",
                 "1" if direct_land else "0",
                 fallback_reason,
                 health_ctrl, health_cloud_src,
                 health_pose_ok, health_cloud_ok,
+                *(self._csv_float(v, 4) for v in fastlio_pose[:3]),
+                *(self._csv_float(v, 2) for v in fastlio_rpy_deg),
+                self.state_manager.height_source,
             ])
             if step % 10 == 0:
                 self._vel_log_file.flush()
@@ -1960,7 +2991,9 @@ class OrinLandingPipeline:
             v_mavros_sp = np.asarray(v_mavros_sp, dtype=np.float32).ravel()
             probs_str = ",".join(f"{p:.4f}" for p in (action_probs or []))
             self._drl_log_writer.writerow([
-                step, cloud_seq, pose_seq,
+                step,
+                f"{(self._rospy.Time.now().to_sec() if self._rospy is not None else time.time()):.6f}",
+                cloud_seq, pose_seq,
                 f"{sync_ms:.1f}" if sync_ms is not None else "n/a",
                 f"{pose_xyz[0]:.3f}", f"{pose_xyz[1]:.3f}", f"{pose_xyz[2]:.3f}",
                 f"{yaw_rad:.4f}",
@@ -1990,6 +3023,136 @@ class OrinLandingPipeline:
             self._drl_log_file = None
             self._drl_log_writer = None
 
+    def _ros_time_now_s(self) -> float:
+        return (
+            self._rospy.Time.now().to_sec()
+            if self._rospy is not None else time.time()
+        )
+
+    @staticmethod
+    def _csv_float(value, digits: int = 3):
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "n/a"
+        return f"{number:.{digits}f}" if math.isfinite(number) else "n/a"
+
+    def _log_mission_event(self, event: str, reason: str = "") -> bool:
+        """Write one deduplicated mission boundary aligned to ROS/rosbag time."""
+        if self._event_log_writer is None or event in self._recorded_mission_events:
+            return False
+        fc = self.fc
+        enu = np.asarray(
+            getattr(fc, "uavPosENU", np.full(3, np.nan)), dtype=np.float64
+        ).ravel()
+        fastlio_pose = np.asarray(
+            getattr(self.fastlio, "pose", np.full(6, np.nan)), dtype=np.float64
+        ).ravel()
+        enu = np.pad(enu, (0, max(0, 3 - enu.size)), constant_values=np.nan)
+        fastlio_pose = np.pad(
+            fastlio_pose, (0, max(0, 3 - fastlio_pose.size)), constant_values=np.nan
+        )
+        height_pose = enu if self._use_body_cloud else fastlio_pose[:3]
+        height_m = self.state_manager.height_from_pose(tuple(height_pose))
+        self._event_log_writer.writerow([
+            event,
+            f"{self._ros_time_now_s():.6f}",
+            f"{time.perf_counter():.6f}",
+            self.mission_state,
+            reason,
+            *(self._csv_float(v, 4) for v in enu[:3]),
+            *(self._csv_float(v, 4) for v in fastlio_pose[:3]),
+            self._csv_float(height_m, 3),
+            "1" if bool(getattr(fc, "isArmed", False)) else "0",
+            "1" if bool(getattr(fc, "isOffboard", False)) else "0",
+            "1" if bool(getattr(fc, "landed_state_on_ground", False)) else "0",
+        ])
+        self._event_log_file.flush()
+        self._recorded_mission_events.add(event)
+        logger.info("[MissionEvent] %s state=%s reason=%s", event, self.mission_state, reason)
+        return True
+
+    def _log_frame_timing(
+        self, *, cloud_stamp_ros_s, cloud_seq, pose_seq, state, sync_ms,
+        pointcloud_preprocess_ms, halss_ms, depth_ms, completion_ms, onnx_ms, control_ms,
+        pipeline_total_ms, source_age_ms, result_age_ms, newer_frames,
+        accepted, fallback_reason,
+    ) -> None:
+        if self._frame_timing_writer is None:
+            return
+        perception_inference_ms = (
+            pointcloud_preprocess_ms + halss_ms + depth_ms + completion_ms + onnx_ms
+        )
+        self._frame_timing_writer.writerow([
+            f"{self._ros_time_now_s():.6f}",
+            self._csv_float(cloud_stamp_ros_s, 6),
+            cloud_seq,
+            pose_seq,
+            state,
+            self._csv_float(sync_ms, 3),
+            self._csv_float(pointcloud_preprocess_ms, 3),
+            self._csv_float(halss_ms, 3),
+            self._csv_float(depth_ms, 3),
+            self._csv_float(completion_ms, 3),
+            self._csv_float(onnx_ms, 3),
+            self._csv_float(perception_inference_ms, 3),
+            self._csv_float(control_ms, 3),
+            self._csv_float(pipeline_total_ms, 3),
+            self._csv_float(source_age_ms, 3),
+            self._csv_float(result_age_ms, 3),
+            int(newer_frames),
+            "1" if accepted else "0",
+            fallback_reason,
+        ])
+        if int(cloud_seq) % 10 == 0:
+            self._frame_timing_file.flush()
+
+    def _log_perception_gate(
+        self, cloud_seq, pose_seq, sync_ms, px4_pose,
+        stage, accepted, reason, points, stats=None,
+    ) -> None:
+        if self._perception_gate_writer is None:
+            return
+        stats = stats or {}
+        pts = np.asarray(points, dtype=np.float32) if points is not None else np.empty((0, 3))
+        finite_ratio = (
+            float(np.mean(np.isfinite(pts[:, :3]).all(axis=1)))
+            if pts.ndim == 2 and pts.shape[0] and pts.shape[1] >= 3 else 0.0
+        )
+        px4 = np.asarray(px4_pose, dtype=np.float64).ravel()
+        px4 = np.pad(px4, (0, max(0, 6 - px4.size)), constant_values=np.nan)
+        fastlio = np.asarray(
+            getattr(self.fastlio, "pose", np.full(6, np.nan)), dtype=np.float64
+        ).ravel()
+        fastlio = np.pad(fastlio, (0, max(0, 6 - fastlio.size)), constant_values=np.nan)
+        self._perception_gate_writer.writerow([
+            self._csv_float(self._ros_time_now_s(), 6),
+            self._csv_float(self.fastlio.points_stamp, 6),
+            int(cloud_seq), int(pose_seq), self._csv_float(sync_ms, 3),
+            int(len(pts)), self._csv_float(stats.get("finite_ratio", finite_ratio), 4),
+            int(stats.get("output_points", 0)),
+            *(self._csv_float(v, 4) for v in px4[:3]),
+            *(self._csv_float(v, 2) for v in np.degrees(px4[3:6])),
+            *(self._csv_float(v, 4) for v in fastlio[:3]),
+            *(self._csv_float(v, 2) for v in np.degrees(fastlio[3:6])),
+            stage, "1" if accepted else "0", reason,
+            "fastlio_deskewed_body" if self._use_body_cloud else "fastlio_world",
+        ])
+        if int(cloud_seq) % 10 == 0:
+            self._perception_gate_file.flush()
+
+    def _close_experiment_logs(self) -> None:
+        for kind in ("event_log", "frame_timing", "perception_gate"):
+            file_obj = getattr(self, f"_{kind}_file", None)
+            if file_obj is not None:
+                try:
+                    file_obj.flush()
+                    file_obj.close()
+                except Exception:
+                    pass
+                setattr(self, f"_{kind}_file", None)
+                setattr(self, f"_{kind}_writer", None)
+
     # ------------------------------------------------------------------
     # Rosbag recording
     # ------------------------------------------------------------------
@@ -1997,11 +3160,12 @@ class OrinLandingPipeline:
     async def _start_recording(self):
         """Start rosbag recording if enabled."""
         if not self._record_bag:
-            return
+            return False
         try:
-            self._setup_run_dir()
             bag_path = self._run_dir / "input.bag"
-            topics = ["/ali_cloud", "/ali_odom"]
+            topics = list(self.cfg.get("experiment_recording", {}).get(
+                "bag_topics", [self.fastlio_cloud_topic, self.fastlio_odom_topic]
+            ))
             cmd = ["rosbag", "record", "-O", str(bag_path)] + topics
             logger.info("[Rosbag] Starting: %s", " ".join(cmd))
             self._bag_process = await asyncio.create_subprocess_exec(
@@ -2015,14 +3179,18 @@ class OrinLandingPipeline:
                 stderr = await self._bag_process.stderr.read()
                 logger.error("[Rosbag] Failed to start: %s", stderr.decode() if stderr else "unknown")
                 self._bag_process = None
+                return False
             else:
                 logger.info("[Rosbag] Recording to %s", bag_path)
+                return True
         except FileNotFoundError:
             logger.warning("[Rosbag] rosbag command not found; skipping recording")
             self._bag_process = None
+            return False
         except Exception as e:
             logger.warning("[Rosbag] Failed to start recording: %s", e)
             self._bag_process = None
+            return False
 
     async def _stop_recording(self):
         """Stop rosbag recording if active."""
@@ -2046,16 +3214,14 @@ class OrinLandingPipeline:
         """Enable/disable rosbag recording (call before run())."""
         self._record_bag = enabled
         if enabled:
-            logger.info("[Rosbag] Recording enabled: /ali_cloud + /ali_odom")
+            topics = self.cfg.get("experiment_recording", {}).get("bag_topics", [])
+            logger.info("[Rosbag] Recording enabled: %d configured topics", len(topics))
 
     async def _emergency_stop(self):
         logger.error("[Pipeline] EMERGENCY STOP!")
         try:
-            yaw_deg = math.degrees(self._yaw_setpoint_rad or 0.0)
-            if self._fc_backend == "mavros" and self.fc is not None:
-                await self.fc.send_zero_velocity_fallback(yaw_deg)
-            elif self.fc is not None:
-                await self.fc.send_velocity_ned_yaw(0.0, 0.0, 0.0, yaw_deg)
+            if self.fc is not None:
+                await self.fc.send_velocity_enu_yaw_rate(0.0, 0.0, 0.0, 0.0)
             if self.fc is not None:
                 await self.fc.disarm()
         except Exception:
@@ -2077,21 +3243,20 @@ def main():
                         help="Precomputed GIS semantic mask path")
     parser.add_argument("--gis-bounds", type=str, default=None,
                         help="lon_left,lat_bottom,lon_right,lat_top")
-    parser.add_argument("--mavsdk-address", type=str, default=None)
     parser.add_argument("--yaw-rate-rad-s", type=float, default=None,
                         help="Override uav.yaw_rate_rad_s for this experiment run")
+    parser.add_argument("--allow-high-yaw-rate-test", action="store_true",
+                        help="Explicitly allow body-cloud yaw-rate tests above 1 and up to 5rad/s")
     parser.add_argument("--onnx-model", type=str, default=None,
-                        help="ONNX DRL policy path (default: zmq_pipeline.drl_control.onnx_model_path or weights/ppo2_policy.onnx)")
+                        help="ONNX DRL policy path (default: decision.onnx_model_path)")
     parser.add_argument("--dmax", type=float, default=None,
                         help="Override depth_projection.max_range for BEV NN-fill depth and ONNX inference")
-    parser.add_argument("--depth-output-scale", type=float, default=None,
-                        help="Legacy compatibility only: updates old depth_completion.output_scale gate; NN-fill/ONNX does not use it")
     parser.add_argument("--flight-ready-check-only", action="store_true",
                         help="Evaluate strict gates with CLI overrides, then exit before model/ROS init")
     parser.add_argument("--allow-incomplete-experiment", action="store_true",
                         help="Bypass strict flight-ready gates for bench debugging only")
     parser.add_argument("--record-bag", action="store_true", default=None,
-                        help="Enable rosbag recording of /ali_cloud and /ali_odom")
+                        help="Enable configured rosbag recording (FAST-LIO + MAVROS localization)")
     parser.add_argument("--no-record-bag", action="store_true", default=None,
                         help="Disable rosbag recording")
     args = parser.parse_args()
@@ -2108,10 +3273,12 @@ def main():
             try:
                 cfg_preview = _load_config(args.config)
                 cfg_preview = _merge_config_overrides(cfg_preview, dict(config_overrides))
-                _, override_failures = _validate_global_guidance_override(args)
+                override_ready, override_failures = _validate_global_guidance_override(args)
                 failures = flight_ready_failures(
                     cfg_preview,
-                    global_guidance_ready=True if override_failures else _config_has_global_guidance(cfg_preview, args),
+                    global_guidance_ready=(
+                        True if override_ready is True and not override_failures else None
+                    ),
                 )
                 failures = override_failures + failures
             except Exception as exc:
@@ -2133,7 +3300,6 @@ def main():
 
     pipeline = OrinLandingPipeline(
         args.config,
-        mavsdk_address=args.mavsdk_address,
         config_overrides=config_overrides,
         onnx_model_path=args.onnx_model,
     )

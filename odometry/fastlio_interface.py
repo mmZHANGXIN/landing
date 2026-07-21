@@ -25,6 +25,8 @@ class FastLIOInterface:
         self._latest_pose = None       # [x, y, z, roll, pitch, yaw]
         self._latest_points = None     # (N, 3) np.ndarray
         self._latest_pose_stamp = None
+        self._latest_pose_covariance = None
+        self._latest_quaternion_norm = None
         self._latest_points_stamp = None
         self._pose_seq = 0
         self._points_seq = 0
@@ -71,6 +73,12 @@ class FastLIOInterface:
         # 四元数 → 欧拉角
         r, p, y = self._quat_to_euler(quat.x, quat.y, quat.z, quat.w)
         self._latest_pose = np.array([pos.x, pos.y, pos.z, r, p, y], dtype=np.float32)
+        self._latest_quaternion_norm = float(
+            np.linalg.norm([quat.x, quat.y, quat.z, quat.w])
+        )
+        self._latest_pose_covariance = np.asarray(
+            msg.pose.covariance, dtype=np.float64
+        ).copy()
         self._latest_pose_stamp = self._stamp_to_sec(msg.header.stamp)
         self._pose_seq += 1
 
@@ -146,6 +154,14 @@ class FastLIOInterface:
     def pose_stamp(self):
         """最新位姿 ROS header 时间戳 (秒)。"""
         return self._latest_pose_stamp
+
+    @property
+    def pose_covariance(self):
+        return self._latest_pose_covariance
+
+    @property
+    def quaternion_norm(self):
+        return self._latest_quaternion_norm
 
     @property
     def points_stamp(self):

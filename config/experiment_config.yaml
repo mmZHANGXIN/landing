@@ -1,69 +1,76 @@
 # ============================================================
-# Orin Landing v2 — 实验配置 (ROS1 Noetic 版)
-# Mid360 LiDAR + FAST-LIO2 + HALSS Bayesian UNet + SparseNet + SB3 PPO
+# Orin Landing v2 — 室内/室外公共配置模板 (ROS1 Noetic 版)
+# 不要直接用于正式飞行；请选择 experiment_indoor_fastlio.yaml 或
+# experiment_outdoor_gps.yaml。场景相关的定位模式、安全点和边界只在 profile 中维护。
+# Mid360 LiDAR + FAST-LIO2 + HALSS Bayesian UNet + NN-fill depth + ONNX PPO2
 # Jetson Orin NX / ROS Noetic / Ubuntu 20.04
 # ============================================================
 
 # ---- 运行时 ----
 runtime:
   use_gpu: true                    # 强制 GPU (ARM64 CPU 有 Conv2d NaN bug)
-  fp16: false                      # 半精度推理 (TensorRT 开启后可用)
-  max_frame_latency_ms: 200        # 单帧超时后丢弃
+  max_inference_result_age_ms: 500 # 点云header年龄+计算耗时小于此值即可执行，不要求绝对最新帧
   max_cloud_odom_sync_ms: 100      # FAST-LIO 点云/位姿 header 最大允许时间差
-  drop_stale_frames: true          # 过期帧不堆积
-  drop_slow_frames: true           # 超过单帧预算时不发送新动作, 发零速度保持
+  drop_stale_frames: true          # 只丢弃超过 max_inference_result_age_ms 的结果
+  drop_slow_frames: true           # 超龄结果不执行，改用 PX4 ENU 固定 XY 闭环保持
   device: "cuda"                   # "cuda" | "cpu" (cpu 仅离线调试)
 
 # ---- 实验录制 (最小 rosbag + 复现记录) ----
 experiment_recording:
-  enabled: false                   # 默认关闭; CLI --record-bag 可覆盖
-  bag_topics:                      # rosbag 只录感知输入
+  enabled: true                    # 正式实验默认录制; CLI --no-record-bag 仅用于台架调试
+  required: true                   # 启用录制时，rosbag 启动失败则禁止进入解锁流程
+  bag_topics:                      # 同时记录两套定位，供每次实验估计 FAST-LIO↔PX4 对齐
+    - "/livox/lidar"
+    - "/livox/imu"
+    - "/cloud_registered_body"
     - "/ali_cloud"
     - "/ali_odom"
-  save_config_snapshot: true       # 保存 experiment_config_snapshot.yaml
-  save_run_metadata: true          # 保存 run_metadata.json (模型hash, git状态等)
-  save_drl_action_log: true        # 保存 drl_action_log.csv (逐帧复现动作信息)
-  save_velocity_commands: true     # 保存 velocity_commands.csv
+    - "/fastlio/degeneracy_metrics"
+    - "/mavros/vision_pose/pose"
+    - "/mavros/local_position/odom"
+    - "/mavros/global_position/global"
+    - "/mavros/imu/data"
+    - "/mavros/state"
+    - "/mavros/extended_state"
+    - "/mavros/setpoint_raw/local"
+    - "/mavros/setpoint_raw/target_local"
+  # 配置快照、运行元数据、动作日志和速度日志为正式实验固定输出，不设关闭开关。
 
 # ---- 观测空间 ----
 observation:
   img_width: 128
   img_height: 128
-  img_channels: 2                  # [dense_depth, binary_semantic]
-  depth_norm_mode: "meters_div255"  # 原SB2: 米制深度经 scale=True 后约等于 D/255; 可对比 "unit"=D/dmax
-  semantic_norm_mode: "gray_unit"   # 原SB2: 语义灰度(terrain=30, others=250) /255; 可对比 "unit"=class_id/9
+  depth_norm_mode: "raw_meters_graph_scaled" # ONNX 图内已有 /255；外部输入原始米制深度
+  semantic_norm_mode: "raw_gray_graph_scaled" # ONNX 图内已有 /255；外部输入原始灰度(terrain=30, others=250)
 
 # ---- 无人机参数 ----
 uav:
-  fc_backend: "mavros"              # "mavros" | "mavsdk" (mavsdk 保留但不作为默认实飞路径)
-  mavsdk_address: "udp://:14540"    # MAVSDK 连接地址 (fc_backend=mavsdk 时使用)
-  vel_lateral: 0.5                 # 水平速度 (m/s)
-  vel_vertical: 0.5                # 垂直速度 (m/s)
-  yaw_rate_rad_s: 0.1              # 偏航转速 (rad/s, 0=不旋转)
+  vel_lateral: 1.0                 # 与 DRL 训练环境一致: 水平速度 (m/s)
+  vel_vertical: 10.0              # 与当前 PPO2 训练动作一致；DIRECT_LAND仍独立限速0.25m/s
+  # 全局唯一偏航率配置入口。正式室外从0开始，按0→0.3→0.5→1.0rad/s分级验证。
+  yaw_rate_rad_s: 5.0              # 偏航转速 (rad/s, 0=不旋转)
   action_frame: "body"             # DRL 横移坐标系: "body" 机体系 / "ned"
+  execution_yaw_source: "px4_ekf"  # body动作转世界速度使用PX4 yaw，避免假设FAST-LIO world=地理NED
   action_lateral_sign: -1          # 原DeepRL动作符号: vel_y=-sin(angle); +1=右手镜像模式
 
-  max_t: 180.0                      # 最大飞行时间 (秒)
+  max_t: 360.0                      # 最大飞行时间 (秒)
   sim_dt: 0.25                     # 决策步长 (秒)
-  target_altitude: 0.5             # 目标降落高度 (米)
-
   # 急停门控
   max_roll_pitch_deg: 30.0         # 最大姿态角 (度)
-  max_velocity_ms: 5.0             # 最大速度 (m/s)
 
 # ---- 飞控通信 (MAVROS/PX4 Offboard) ----
 flight_controller:
-  backend: "mavros"                 # "mavros" | "mavsdk"
+  backend: "mavros"                 # 当前真机入口仅支持 MAVROS
   mavros_ns: "/mavros"             # MAVROS 命名空间
   setpoint_rate_hz: 20             # setpoint_raw 发布频率
   offboard_warmup_s: 2.0           # OFFBOARD 模式切换前 setpoint 预热时长
 
 # ---- 任务状态机 ----
 mission_state:
-  height_source: "fastlio_z"       # 默认使用重力校准后的 Fast-LIO/local z 作为高度源
-  height_axis: "neg_z"             # NED/FAST-LIO 常见约定: 高度 = ground_z_ref - z
-  ground_z_ref_m: 0.0              # 地面高度基准; 起飞地面为 0 时可直接使用
-  auto_ground_z_ref: false         # true=IDLE时用当前pose.z自动记录地面基准
+  height_source: "fastlio_z"       # 室外profile覆盖为px4_enu_z；室内仍使用FAST-LIO
+  height_axis: "pos_z"
+  ground_z_ref_m: 0.0              # 地面高度基准; auto_ground_z_ref=true 时自动记录
+  auto_ground_z_ref: true          # true=IDLE时用当前pose.z自动记录地面基准
   direct_land_enabled: true
   direct_land_trigger_height_m: 0.5
   landed_height_m: 0.15
@@ -73,78 +80,62 @@ mission_state:
   perception_timeout_s: 0.5
   timeout_direct_land_max_height_m: 0.8
   pose_timeout_s: 0.2
-  max_cloud_odom_sync_ms: 100
   ground_crosscheck_enabled: true  # 点云地面距离只做交叉校验, 不作为默认高度源
   ground_crosscheck_action: "warn" # "warn" | "block"
   ground_crosscheck_max_error_m: 0.5
 
-  # --- XY 边界保护 (室内安全) ---
-  boundary_enable: true           # 启用 XY 边界检查
-  boundary_x_min: -1.0             # 北向最小 (m, NED frame)
-  boundary_x_max: 1.0              # 北向最大 (m, NED frame)
-  boundary_y_min: -1.0             # 东向最小 (m, NED frame)
-  boundary_y_max: 1.0              # 东向最大 (m, NED frame)
-  boundary_trigger_action: "direct_land"  # 越界动作: "direct_land" | "hold" | "abort"
-
-  # --- 全局安全先验模式 ---
-  global_prior_mode: "local_body_offset"         # "gps"=GPS坐标引导 | "local_body_offset"=室内机体系偏移引导
-
 # ---- 定位源约定 ----
 localization:
-  mode: "fastlio_external_vision"  # "fastlio_external_vision" | "mocap_external_vision"
-  # 控制定位源
-  control_pose_primary: "fastlio_gravity_aligned"   # 主: FAST-LIO 重力校准位姿
-  control_pose_fallback: "mavros_gps_ekf"           # 备: MAVROS/PX4 GPS/EKF local position
-  allow_gps_fallback: true                           # 是否允许室外 GPS fallback
-  gps_fallback_only_when_fastlio_degraded: true      # 仅 FAST-LIO pose 退化时才用 GPS
-  # 感知输入源 (不随控制定位切换)
-  perception_cloud_source: "fastlio_deskewed_gravity_aligned"
+  # mode 与 px4_position_source 由 indoor/outdoor profile 显式设置。
   # 话题
   fastlio_odom_topic: "/ali_odom"
   world_cloud_topic: "/ali_cloud"
-  external_pose_topic: "/mavros/vision_pose/pose"
-  local_odom_topic: "/mavros/local_position/odom"
-  mavros_local_odom_topic: "/mavros/local_position/odom"
-  mavros_global_fix_topic: "/mavros/global_position/global"
   body_cloud_topic: "/cloud_registered_body"
-  T_fcu_lidar: [0.13, 0.0, 0.08, 0.0, 0.0, 0.0, 1.0]
+  max_gps_age_s: 2.0
+  max_gps_horizontal_accuracy_m: 5.0
+  external_pose_topic: "/mavros/vision_pose/pose" # 室内发布、室外禁止发布，由 FAST-LIO launch 参数控制
+  local_odom_topic: "/mavros/local_position/odom"
 
 # ---- FAST-LIO 健康门控 ----
 fastlio_health:
+  require_static_initialization: true
+  static_initialization_s: 5.0
+  static_max_drift_m: 0.2
+  initial_position_norm_max_m: 50.0
   max_pose_age_ms: 200              # 位姿最大允许时延
   max_cloud_age_ms: 200             # 点云最大允许时延
   max_cloud_odom_sync_ms: 100       # 点云-位姿最大时间同步偏移
   min_cloud_points: 50              # 点云最少点数
   pose_jump_threshold_m: 1.0        # 位姿跳变阈值 (米)
   yaw_jump_threshold_deg: 20.0      # yaw 跳变阈值 (度)
-  degraded_control_action: "use_gps_fallback"  # pose 退化时的控制动作
+  degraded_control_action: "direct_land"       # FAST-LIO pose 退化时使用 MAVROS ENU 锁 XY 降落
   degraded_cloud_action: "direct_land"         # cloud 退化时的安全动作 ("direct_land" | "abort")
 
 # ---- 感知: HALSS 贝叶斯安全语义 ----
 perception:
-  halss_backend: "bayesian_unet"   # "bayesian_unet" | "gpu_sobel" | "original_delaunay"
+  halss_backend: "bayesian_unet"
   require_gpu: true                 # 真机禁止 HALSS Bayesian 推理静默回退 CPU
   world_z_up: true                  # ENU world (z-up); HALSS needs z-down, so auto-negate z
   pose_origin_frame: "base_link"   # "base_link": /ali_odom is already body pose; "lidar_imu": pose is at IMU origin
+  # /cloud_registered_body is expressed at the Mid360 IMU origin.
+  body_R_from_lidar_imu: [-0.438371, 0.0, 0.898794, 0.0, 1.0, 0.0, -0.898794, 0.0, -0.438371]
+  body_T_from_lidar_imu: [0.13, 0.0, 0.08]
 
   # --- Bayesian UNet 参数 ---
-  halss_weight_path: "arch/3.UDPDirect30Hz_cyd_final/HALO-master (2)/HALSS/network_utils/unet_epoch6.pth"
+  halss_weight_path: "../arch/3.UDPDirect30Hz_cyd_final/HALO-master (2)/HALSS/network_utils/unet_epoch6.pth"
   halss_grid_res: 64               # surface normal 网格分辨率 (必须被 16 整除)
   mc_samples: 5                    # MC Dropout 采样数
-  uncertainty_threshold: 0.5       # 方差阈值 (超过则判为危险)
+  uncertainty_threshold: 0.8       # 方差阈值 (超过则判为危险)
 
-  # --- 通用 ---
+  # --- 语义与 ROI ---
   safe_class_id: 1                 # 语义图安全类别 ID
   danger_class_id: 9               # 语义图危险类别 ID
-  roi_radius_world: 25.0           # 感知范围半径 (米) [legacy, 新ROI不再使用]
-  halss_roi_radius_body: 25.0      # [legacy] HALSS 下视机体系 ROI 半径 (米)
-  halss_roi_half_x_m: 5.0          # [legacy static fallback] 水平机体 ROI 半宽 forward (m)
-  halss_roi_half_y_m: 5.0          # [legacy static fallback] 水平机体 ROI 半宽 lateral (m)
+  halss_roi_half_x_m: 5.0          # 动态 ROI 关闭时的 forward 半宽 (m)
+  halss_roi_half_y_m: 5.0          # 动态 ROI 关闭时的 lateral 半宽 (m)
 
-  # --- 动态 FOV ROI (高度自适应, 模拟深度相机) ---
-  halss_roi_fov_half_deg: 45.0     # 虚拟深度相机半视场角 (90° 总FOV)
-  halss_roi_min_half_m: 0.5        # 最低高度时 ROI 最小半宽 (m)
-  halss_roi_max_half_m: 15.0       # 最高高度时 ROI 最大半宽 (m)
+  # --- 动态 ROI（training_camera 模式按原训练相机内参计算前后/左右范围）---
+  halss_roi_min_half_m: 0.05       # 仅数值下限，不对低高度训练相机 FOV 人为放大
+  halss_roi_max_half_m: 30.0       # 覆盖30m高度训练相机的完整左右视场
   halss_roi_height_source: "pose_z" # 高度源: "pose_z"=Fast-LIO z减去起飞z | "pointcloud_median"=点云z中位数
   halss_roi_dynamic_enabled: true  # true=按高度动态缩放ROI | false=用halss_roi_half_x_m/y_m静态值
 
@@ -154,85 +145,54 @@ perception:
   halss_yaw_only: true             # HALSS 用世界重力+yaw 对齐, 不把安装俯仰当坡度
   halss_lidar_position_body_m: [0.13, 0.0, 0.08]  # Mid360 相对机体中心 [前,右,下] 米: 图中 13cm / 0cm / 8cm
   halss_lidar_yaw_offset_deg: 0.0  # Mid360 水平安装偏航误差; 图中未标侧向/偏航, 暂按 0
-  halss_lidar_pitch_down_deg: 26.0 # Mid360 探测轴相对机体垂直向下方向前倾 26 度
-  # 完整安装旋转记录: R_body_from_lidar = Ry(+26deg), 假设 LiDAR +Z 为下视探测轴
-  halss_lidar_rotation_body_from_lidar:
-    - [0.898794, 0.0, 0.438371]
-    - [0.0, 1.0, 0.0]
-    - [-0.438371, 0.0, 0.898794]
+  # 116°安装旋转只在 FAST-LIO config/mid360.yaml 中维护。
+  # /ali_cloud 已完成外参和重力对齐，主管线禁止再次应用安装旋转。
 
-  # --- GPU Sobel 版参数 (halss_backend=gpu_sobel 时使用) ---
-  slope_threshold_deg: 10.0
-  roughness_threshold: 0.1
-  grid_resolution: 0.1
-
-  # --- 原始 Delaunay 版参数 (halss_backend=original_delaunay 时使用) ---
-  x_cell_size: 2.0
-  y_cell_size: 2.0
-  max_sites: 12
-
-# ---- 深度投影 ----
+# ---- 当前真机深度路径: 原训练相机几何 + OpenCV NN-fill ----
 depth_projection:
-  mode: "perspective"              # 保留世界系透视测试/消融路径; 真机调用 HALSS-aligned body ROI 投影
-  backend: "torch_cuda"             # 真机飞行使用 PyTorch CUDA z-buffer；本地几何测试可显式用 numpy
+  mode: "training_camera"
+  backend: "numpy_opencv_nn_fill"
   max_range: 30.0                  # 深度图最大距离 dmax (米)
   grid_cells: 128                  # 输出分辨率 (128×128)
-  fx: 64.0                         # 下视虚拟相机内参
-  fy: 64.0
-  cx: 63.5
-  cy: 63.5
-  # 机体系 I: x=forward, y=right, z=down; 下视相机 C: Z=down, X=right, Y=forward
-  R_I_to_C:
-    - [0.0, 1.0, 0.0]
-    - [1.0, 0.0, 0.0]
-    - [0.0, 0.0, 1.0]
+  training_camera:
+    source_width: 752
+    source_height: 480
+    source_fx: 455.0
+    source_fy: 455.0
+    source_cx: 376.5
+    source_cy: 240.5
+    output_width: 128
+    output_height: 128
+    near_m: 0.05
+    far_m: 30.0
 
-# ---- 深度补全: Sparsity-Invariant CNN ----
-depth_completion:
-  backend: "sparsity_invariant_cnn"
-  framework: "torch"               # "torch" | "tensorrt"
-  weight_path: "weights/sparsenet.pth"
-  input_size: 128                  # 输入/输出分辨率
-  dmax: 30.0                       # 深度上限 (米)
-  input_encoding: "inverse_unit"    # "inverse_unit": x=1-D/dmax | "unit": x=D/dmax
-  latency_budget_ms: 40            # 单帧耗时预算
-  output_scale: 25.0               # 归一化输出scale (地面实测标定后填入, 补偿 bias=0 衰减)
+# SparseNet 已停用；旧模块仅保留给离线对比，不参与 pipeline.py。
 
 # ---- RL 决策 ----
 decision:
-  action_set_size: 10              # 离散动作数: 0=hover, 1-8=8方向, 9=descend
-  policy_weights_path: "weights/last_step_model_sb3.zip"
-  require_gpu: true                 # 真机禁止 SB3/PyTorch 策略静默回退 CPU
+  backend: "onnx"
+  onnx_model_path: "weights/ppo2_policy.onnx"
+  onnx_meta_path: "weights/ppo2_policy_meta.json"
+  require_gpu: true                 # 真机禁止策略推理静默回退 CPU
 
 # ---- 全局安全先验 (离线 GIS 预处理结果) ----
 global_prior:
-  enabled: true                   # 是否启用全局引导阶段
-  mode: "local_body_offset"        # "gps"=GPS坐标 | "local_body_offset"=室内机体系偏移
-  target_lat: null                 # 最低风险格中心纬度 (mode=gps 时使用)
-  target_lon: null                 # 最低风险格中心经度 (mode=gps 时使用)
-  target_altitude_m: 2.0           # 目标安全高度 (mode=gps 时使用, 相对起飞点)
-  target_source: null              # 若使用target_lat/lon, 必须为 "gis" 才满足真飞门禁
+  # enabled、mode 与安全点由 indoor/outdoor profile 显式设置。
   goto_tolerance_xy_m: 0.2         # XY 到达容差 (米)
-  goto_tolerance_z_m: 0.15         # Z 到达容差 (米)
-  goto_max_time_s: 30.0            # GOTO 阶段最大超时 (秒), 超时后由配置决定进入 DIRECT_LAND 或 ABORT
+  goto_tolerance_z_m: 0.2         # Z 到达容差 (米)
+  goto_max_time_s: 80.0            # GOTO 阶段最大超时 (秒), 超时后由配置决定进入 DIRECT_LAND 或 ABORT
   goto_timeout_action: "direct_land"  # 超时动作: "direct_land" | "abort"
-  goto_speed_xy_ms: 0.2            # GOTO 阶段水平速度 (m/s), 室内应低速保守
-  goto_speed_z_ms: 0.25            # GOTO 阶段垂直速度 (m/s)
+  takeoff_speed_z_ms: 2.0           # Phase 1 垂直起飞速度，与 DRL 动作速度分离
+  goto_max_horizontal_speed_mps: 2.0 # 室外GOTO速度XY硬上限；室内profile不启用该速度模式
+  goto_max_vertical_speed_mps: 2.0   # 人工接管后的30m归位与GOTO垂直速度硬上限
+  goto_horizontal_kp_s: 1.0          # 临近目标按v=kp*距离减速，最大不超过上述上限
 
-  # --- 室内本地安全点 (mode=local_body_offset) ---
-  local_body_offset_m: [0.0, 0.0, 2.0]  # [forward_m, right_m, up_m] 相对起飞点的机体系三维偏移
-                                    # 例如: 机头前方0m、右方0m、上方2.0m (正上方悬停)
-
-  image_path: null                 # GIS 卫星图路径 (enabled=true 且 target_lat/lon 为空时使用)
-  sem_mask_path: null              # 可选: 预计算 GIS 语义 mask 路径
-  bounds: null                     # lon_left,lat_bottom,lon_right,lat_top
-  save_dir: null                   # 可选: 保存 GIS 九宫格评估结果
   # GIS 离线分割模型
   model_arch: "segformer"          # "segformer" | "fastscnn" | "unet"
   model_path: "preprocessing/segmentation/checkpoints/segformer_best.pth"
   # 九宫格参数
   grid_size_cells: 3               # 3×3 九宫格
-  cell_size_m: 50.0                # 每格边长 (米)
+  cell_size_m: 95.0                # 每格边长 (米)
 
 # ---- 可视化 ----
 visualization:
@@ -244,64 +204,12 @@ visualization:
   depth_vmax_m: 30.0               # 深度相机式渲染固定色标上限
   binary_semantic_window_title: "binary semantic"
   save_frames: false
-  save_raw_arrays: false           # 保存 *_calib_frame.npz, 用于 SparseNet output_scale 标定
+  save_raw_arrays: false           # 旧离线调试开关，当前主管线不使用
   save_dir: "experiments/frames"
   action_collapse_monitor: true    # 连续同一DRL动作时告警并保存诊断帧
   action_collapse_window: 20        # 连续N帧同一动作触发
   action_collapse_min_confidence: 0.0
   action_collapse_save_snapshot: true
 
-# ============================================================
-# 多环境 ZeroMQ 通信配置 (感知-补全-DRL 解耦)
-# ============================================================
-zmq_pipeline:
-  enabled: true                     # 启用 ZeroMQ 解耦管线
-  protocol_version: 1
-
-  # --- 感知节点 (orin_perception_pytorch) ---
-  perception:
-    pub_address: "tcp://127.0.0.1:5555"       # PUB 地址
-    halss_weight_path: "arch/3.UDPDirect30Hz_cyd_final/HALO-master (2)/HALSS/network_utils/unet_epoch6.pth"
-    output_width: 128
-    output_height: 128
-    depth_dmax_m: 30.0
-    publish_rate_hz: 30                        # 目标发布频率
-
-  # --- 深度补全节点 (orin_depth_tfkeras) ---
-  depth_completion:
-    sub_address: "tcp://127.0.0.1:5555"       # 订阅感知输出
-    pub_address: "tcp://127.0.0.1:5556"       # 发布给 DRL
-    sparsenet_weight_path: "arch/Sparsity-Invariant-CNNs-master/checkpoints/sparsenet.ckpt"
-    input_size: 128
-    dmax: 30.0
-    high_pass_noop: false                      # true=跳过补全, 直接转发 (调试用)
-    latency_budget_ms: 40
-
-  # --- DRL 决策节点 (orin_drl_onnx) ---
-  # 推荐路径: x86 TF1 PPO2 → ONNX 导出 → Orin onnxruntime 推理
-  # 导出步骤 (在 x86 机器执行一次):
-  #   python scripts/export_ppo2_to_onnx.py \
-  #       --model arch/DeepRL/data/trained_policy/last_step_model.zip \
-  #       --output weights/ppo2_policy.onnx
-  drl_control:
-    backend: "onnx"                            # "onnx" (推荐Orin) | "tf1" (需x86)
-    sub_address: "tcp://127.0.0.1:5556"       # 订阅补全输出
-    ppo2_model_path: "arch/DeepRL/data/trained_policy/last_step_model.zip"  # 源模型 (仅x86导出用)
-    onnx_model_path: "weights/ppo2_policy.onnx"  # ONNX 模型
-    onnx_meta_path: "weights/ppo2_policy_meta.json"
-    vel_lateral: 1.0
-    vel_vertical: 1.0
-    dmax: 30.0
-    watchdog_timeout_ms: 500                   # 超时未收到帧 → 悬停
-    fc_mode: "noop"                            # "noop" | "mavsdk" | "mavlink"
-    mavsdk_address: "udp://:14540"
-    print_stats: true                          # 打印每帧统计
-    # Orin 推理环境 (drl_onnx, Python 3.8):
-    #   pip install numpy opencv-python pyzmq onnxruntime pyyaml
-    #   ONNX Runtime CPU (GPU 包常与 JetPack CUDA/TensorRT 版本绑定)
-
-  # --- 离线验证 ----
-  validation:
-    offline_test_input: null                   # 离线测试 .npz 路径
-    compare_legacy_obs: false                  # 对比旧路径 vs ZeroMQ 路径观测
-    save_intermediate_frames: false            # 保存中间帧用于调试
+# ZeroMQ 感知/补全/DRL 三服务链路已停用。旧服务文件仅保留做离线参考，
+# 当前 pipeline.py 为单进程 HALSS + NN-fill + ONNX + MAVROS 闭环。

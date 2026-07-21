@@ -23,10 +23,10 @@
   "observation_space_high": 255.0,
   "action_space_n": 10,
   "opset_version": 11,
-  "normalization": "obs/255  (VecNormalize scale=True on Box(0,255))",
+  "normalization": "ONNX graph input/truediv performs obs/255; caller feeds raw Box(0,255)",
   "export_notes": [
     "PPO2 CNN policy inference subgraph only",
-    "Input: (N, H, W, C) float32, range [0, 1]",
+    "External input: (N, H, W, C) float32, raw range [0, 255]",
     "Output: (N, 10) float32 action logits",
     "Use argmax(logits) to get discrete action 0-9"
   ]

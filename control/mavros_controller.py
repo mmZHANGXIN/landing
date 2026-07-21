@@ -21,6 +21,7 @@ OFFBOARD 丢失 / disarmed 安全:
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import logging
 import math
 import threading
@@ -99,12 +100,20 @@ class MAVROSController:
         # ROS 句柄
         self._rospy = None
         self._node_initialized = False
-        self._lock = threading.Lock()
+        # Callbacks and the setpoint heartbeat share one atomic state snapshot.
+        # RLock also permits _publish_current_position_hold() to account for a
+        # publication while it already owns the state lock.
+        self._lock = threading.RLock()
 
         # ---- 原始 ENU 状态 (对齐 test_mavros_velocity.py) ----
         self.uavPosENU = np.zeros(3, dtype=np.float32)       # [x_east, y_north, z_up]
         self.uavVelENU = np.zeros(3, dtype=np.float32)       # [vx_east, vy_north, vz_up]
         self.uavYawENU = 0.0                                  # ENU yaw (0=East, CCW+)
+        self.uavYawRateENU = 0.0                              # measured yaw rate (rad/s)
+        self.uavRollENU = 0.0
+        self.uavPitchENU = 0.0
+        self._local_odom_stamp = None
+        self._odom_history = deque(maxlen=400)
 
         # ---- 向后兼容 NED 字段 (从 ENU 自动转换) ----
         self.uavPosNED = np.zeros(3, dtype=np.float32)       # [north, east, down]
@@ -113,6 +122,9 @@ class MAVROSController:
         self.uavAngRate = np.zeros(3, dtype=np.float32)       # [p, q, r]
         self.uavThrust = 0.0
         self.uavLatLon = (0.0, 0.0)                           # (lat, lon) 度
+        self.gpsStatus = None
+        self.gpsHorizontalAccuracyM = None
+        self._gps_stamp = None
 
         self.isVehicleCrash = False
         self.landed_state_on_ground = False
@@ -140,7 +152,13 @@ class MAVROSController:
         self._setpoint_thread = None
         self._setpoint_running = False
         self._current_setpoint = None  # (type_mask, vx, vy, vz, yaw, yaw_rate)
+        self._setpoint_publish_count = 0
+        self._setpoint_stream_started_at = None
         self._hold_stream_active = False  # True = 持续发送当前位置 hold
+        # Optional mixed setpoint with independent position/velocity fields.
+        # Existing APIs keep using _current_setpoint; this is only populated
+        # for modes such as GOTO (velocity XY + position Z).
+        self._current_mixed_setpoint = None
 
         # 最后发送的 setpoint (用于日志)
         self._last_sent_mavros_sp = np.zeros(3, dtype=np.float32)
@@ -301,6 +319,7 @@ class MAVROSController:
             enu_vy = float(twist.linear.y)
             enu_vz = float(twist.linear.z)
             self.uavVelENU = np.array([enu_vx, enu_vy, enu_vz], dtype=np.float32)
+            self.uavYawRateENU = float(twist.angular.z)
 
             # ENU yaw
             q = pose.orientation
@@ -315,20 +334,89 @@ class MAVROSController:
             self.uavVelNED = np.array([vn, ve, vd], dtype=np.float32)
 
             roll_enu, pitch_enu, _ = self._quat_to_euler(q.x, q.y, q.z, q.w)
+            self.uavRollENU = float(roll_enu)
+            self.uavPitchENU = float(pitch_enu)
             yaw_ned = enu_yaw_to_ned_yaw(yaw_enu)
             self.uavAngEular = np.array([pitch_enu, roll_enu, yaw_ned], dtype=np.float32)
+
+            stamp = float(msg.header.stamp.to_sec()) if hasattr(msg.header.stamp, "to_sec") else (
+                float(msg.header.stamp.secs) + float(msg.header.stamp.nsecs) * 1e-9
+            )
+            self._local_odom_stamp = stamp
+            self._odom_history.append({
+                "stamp": stamp,
+                "position_enu": self.uavPosENU.copy(),
+                "velocity_enu": self.uavVelENU.copy(),
+                "roll": self.uavRollENU,
+                "pitch": self.uavPitchENU,
+                "yaw_enu": self.uavYawENU,
+                "yaw_rate_enu": self.uavYawRateENU,
+            })
 
             self._enu_ready = True
             self._ned_ready = True
             self._attitude_ready = True
 
+    def get_odom_nearest(self, stamp_s: float, max_delta_ms: float = 100.0):
+        """Return the PX4 odometry sample nearest a ROS timestamp."""
+        with self._lock:
+            if not self._odom_history:
+                return None
+            sample = min(self._odom_history, key=lambda item: abs(item["stamp"] - float(stamp_s)))
+            delta_ms = abs(float(sample["stamp"]) - float(stamp_s)) * 1000.0
+            if delta_ms > float(max_delta_ms):
+                return None
+            result = dict(sample)
+            result["position_enu"] = sample["position_enu"].copy()
+            result["velocity_enu"] = sample["velocity_enu"].copy()
+            result["sync_ms"] = delta_ms
+            return result
+
     def _gps_cb(self, msg: "NavSatFix"):
         with self._lock:
             lat = float(msg.latitude)
             lon = float(msg.longitude)
-            if self._valid_lat_lon(lat, lon):
+            self.gpsStatus = int(msg.status.status)
+            stamp = msg.header.stamp
+            self._gps_stamp = (
+                float(stamp.to_sec()) if hasattr(stamp, "to_sec")
+                else float(stamp.secs) + float(stamp.nsecs) * 1e-9
+            )
+            covariance_type = int(getattr(msg, "position_covariance_type", 0))
+            covariance = list(getattr(msg, "position_covariance", []))
+            if covariance_type != 0 and len(covariance) >= 5:
+                horizontal_variance = max(float(covariance[0]), float(covariance[4]))
+                self.gpsHorizontalAccuracyM = (
+                    math.sqrt(horizontal_variance)
+                    if math.isfinite(horizontal_variance) and horizontal_variance >= 0.0
+                    else None
+                )
+            else:
+                self.gpsHorizontalAccuracyM = None
+            if self._valid_lat_lon(lat, lon) and self.gpsStatus >= 0:
                 self.uavLatLon = (lat, lon)
                 self._gps_ready = True
+            else:
+                self._gps_ready = False
+
+    def gps_health(self, max_age_s: float = 2.0, max_horizontal_accuracy_m: float = 5.0):
+        """Return ``(healthy, reason)`` for the latest MAVROS NavSatFix."""
+        with self._lock:
+            if not self._gps_ready or self.gpsStatus is None or self.gpsStatus < 0:
+                return False, "gps_no_fix"
+            if self._gps_stamp is None:
+                return False, "gps_timestamp_missing"
+            now_s = (
+                float(self._rospy.Time.now().to_sec())
+                if self._rospy is not None else time.time()
+            )
+            age_s = max(0.0, now_s - float(self._gps_stamp))
+            if age_s > float(max_age_s):
+                return False, f"gps_stale:{age_s:.2f}s"
+            hacc = self.gpsHorizontalAccuracyM
+            if hacc is not None and hacc > float(max_horizontal_accuracy_m):
+                return False, f"gps_horizontal_accuracy:{hacc:.2f}m"
+            return True, "ok" if hacc is not None else "ok_covariance_unknown"
 
     # ------------------------------------------------------------------
     # Setpoint 持续流 (Offboard 心跳)
@@ -339,6 +427,7 @@ class MAVROSController:
         if self._setpoint_running:
             return
         self._setpoint_running = True
+        self._setpoint_stream_started_at = time.perf_counter()
         self._setpoint_thread = threading.Thread(
             target=self._setpoint_stream_loop, daemon=True
         )
@@ -375,6 +464,36 @@ class MAVROSController:
         | _MASK_IGNORE_YAW_RATE
     )  # = 2552
 
+    _MASK_VELOCITY_YAWRATE = (
+        _MASK_IGNORE_PX | _MASK_IGNORE_PY | _MASK_IGNORE_PZ
+        | _MASK_IGNORE_AFX | _MASK_IGNORE_AFY | _MASK_IGNORE_AFZ
+        | _MASK_IGNORE_YAW
+    )  # = 1479: 速度控制 + yaw_rate (角速度)
+
+    _MASK_POSITION_YAWRATE = (
+        _MASK_IGNORE_VX | _MASK_IGNORE_VY | _MASK_IGNORE_VZ
+        | _MASK_IGNORE_AFX | _MASK_IGNORE_AFY | _MASK_IGNORE_AFZ
+        | _MASK_IGNORE_YAW
+    )  # = 1528: 位置控制 + yaw_rate (角速度)
+
+    _MASK_LANDING_YAWRATE = (
+        _MASK_IGNORE_PZ | _MASK_IGNORE_VX | _MASK_IGNORE_VY
+        | _MASK_IGNORE_AFX | _MASK_IGNORE_AFY | _MASK_IGNORE_AFZ
+        | _MASK_IGNORE_YAW
+    )  # = 1516: 位置 XY + 速度 Z + yaw_rate (降落)
+
+    _MASK_POSITION_XY_VELOCITY_Z_YAW = (
+        _MASK_IGNORE_PZ | _MASK_IGNORE_VX | _MASK_IGNORE_VY
+        | _MASK_IGNORE_AFX | _MASK_IGNORE_AFY | _MASK_IGNORE_AFZ
+        | _MASK_IGNORE_YAW_RATE
+    )  # = 2524: 位置 XY + 速度 Z + yaw
+
+    _MASK_VELOCITY_XY_POSITION_Z_YAWRATE = (
+        _MASK_IGNORE_PX | _MASK_IGNORE_PY | _MASK_IGNORE_VZ
+        | _MASK_IGNORE_AFX | _MASK_IGNORE_AFY | _MASK_IGNORE_AFZ
+        | _MASK_IGNORE_YAW
+    )  # = 1507: 速度 XY + 位置 Z + yaw_rate (限速 GOTO)
+
     def _setpoint_stream_loop(self):
         """后台线程: 以固定频率发布 setpoint_raw."""
         rate = self._rospy.Rate(self._setpoint_rate_hz)
@@ -383,13 +502,17 @@ class MAVROSController:
                 if self._hold_stream_active:
                     self._publish_current_position_hold()
                 else:
-                    sp = self._current_setpoint
+                    with self._lock:
+                        sp = self._current_setpoint
+                        mixed_sp = self._current_mixed_setpoint
                     if sp is None:
                         self._publish_setpoint(
                             type_mask=self._MASK_VELOCITY_YAW,
                             vx=0.0, vy=0.0, vz=0.0,
                             yaw=0.0, yaw_rate=0.0,
                         )
+                    elif mixed_sp is not None:
+                        self._publish_mixed_setpoint(*mixed_sp)
                     else:
                         self._publish_setpoint(*sp)
             except Exception as e:
@@ -412,36 +535,86 @@ class MAVROSController:
 
     def _publish_setpoint(self, type_mask: int, vx: float, vy: float, vz: float,
                           yaw: float, yaw_rate: float = 0.0):
-        """发布单帧 PositionTarget 到 /mavros/setpoint_raw/local (ENU 约定)."""
+        """发布单帧 PositionTarget 到 /mavros/setpoint_raw/local (ENU 约定).
+
+        同时填充 position 和 velocity 字段, PX4 根据 type_mask 决定使用哪些.
+        支持混合模式 (如位置 XY + 速度 Z).
+        """
+        self._publish_mixed_setpoint(
+            type_mask,
+            float(vx), float(vy), float(vz),
+            float(vx), float(vy), float(vz),
+            float(yaw), float(yaw_rate),
+        )
+
+    def _publish_mixed_setpoint(
+        self, type_mask: int,
+        px: float, py: float, pz: float,
+        vx: float, vy: float, vz: float,
+        yaw: float, yaw_rate: float = 0.0,
+    ):
+        """Publish independent ENU position/velocity fields selected by type_mask."""
         msg = self._PositionTarget()
         msg.header.stamp = self._rospy.Time.now()
         msg.coordinate_frame = self._PositionTarget.FRAME_LOCAL_NED
         msg.type_mask = int(type_mask)
 
-        is_velocity_mode = (type_mask & self._MASK_IGNORE_PX) != 0
-        if is_velocity_mode:
-            msg.velocity.x = float(vx)
-            msg.velocity.y = float(vy)
-            msg.velocity.z = float(vz)
-            self._last_sent_mavros_sp = np.array([vx, vy, vz], dtype=np.float32)
-        else:
-            msg.position.x = float(vx)
-            msg.position.y = float(vy)
-            msg.position.z = float(vz)
-            self._last_sent_mavros_sp = np.array([vx, vy, vz], dtype=np.float32)
+        msg.position.x = float(px)
+        msg.position.y = float(py)
+        msg.position.z = float(pz)
+        msg.velocity.x = float(vx)
+        msg.velocity.y = float(vy)
+        msg.velocity.z = float(vz)
 
+        # 同时填 yaw 和 yaw_rate — PX4 按 mask 位选择性读取
         msg.yaw = float(yaw)
         msg.yaw_rate = float(yaw_rate)
+
+        self._last_sent_mavros_sp = np.array([vx, vy, vz], dtype=np.float32)
         try:
             self._setpoint_pub.publish(msg)
+            with self._lock:
+                self._setpoint_publish_count += 1
         except Exception:
             pass
 
     def _update_setpoint(self, type_mask: int, vx: float, vy: float, vz: float,
                          yaw: float, yaw_rate: float = 0.0):
         """更新后台流式发布的 setpoint 值 (ENU 约定)."""
-        self._current_setpoint = (type_mask, vx, vy, vz, yaw, yaw_rate)
-        self._last_setpoint_time = time.perf_counter()
+        with self._lock:
+            self._current_setpoint = (type_mask, vx, vy, vz, yaw, yaw_rate)
+            self._current_mixed_setpoint = None
+            self._last_setpoint_time = time.perf_counter()
+
+    def _update_mixed_setpoint(
+        self, type_mask: int,
+        px: float, py: float, pz: float,
+        vx: float, vy: float, vz: float,
+        yaw: float, yaw_rate: float = 0.0,
+    ):
+        """Atomically update a setpoint with independent position/velocity values."""
+        with self._lock:
+            # Keep the compact tuple for status reporting and compatibility.
+            self._current_setpoint = (type_mask, vx, vy, vz, yaw, yaw_rate)
+            self._current_mixed_setpoint = (
+                type_mask, px, py, pz, vx, vy, vz, yaw, yaw_rate
+            )
+            self._last_setpoint_time = time.perf_counter()
+
+    def get_setpoint_status(self) -> dict:
+        """Return an atomic snapshot used by experiment logging."""
+        with self._lock:
+            sp = self._current_setpoint
+            updated = self._last_setpoint_time
+            count = self._setpoint_publish_count
+            started = self._setpoint_stream_started_at
+        elapsed = 0.0 if started is None else max(0.0, time.perf_counter() - started)
+        return {
+            "type_mask": None if sp is None else int(sp[0]),
+            "yaw_rate_rad_s": 0.0 if sp is None else float(sp[5]),
+            "updated_monotonic_s": updated,
+            "publish_rate_hz": 0.0 if elapsed <= 0.0 else float(count) / elapsed,
+        }
 
     # ------------------------------------------------------------------
     # 手动 OFFBOARD + 解锁等待 (新流程)
@@ -465,7 +638,11 @@ class MAVROSController:
         self._hold_stream_active = False
         logger.info("[MAVROS] Hold stream stopped")
 
-    async def wait_for_manual_offboard_and_arm(self, timeout_s: float = 120.0) -> bool:
+    async def wait_for_manual_offboard_and_arm(
+        self,
+        timeout_s: float = 120.0,
+        post_arm_yaw_rate_rad_s=None,
+    ) -> bool:
         """等待遥控器切 OFFBOARD 并解锁.
 
         阻塞直到:
@@ -495,7 +672,33 @@ class MAVROSController:
                 )
                 # 预热: 等待 OFFBOARD 稳定
                 await asyncio.sleep(self._offboard_warmup_s)
+                # Atomically hand off from the ground-safe hold before
+                # disabling hold_stream. Callers choose fixed yaw or yaw-rate.
+                with self._lock:
+                    x, y, z = (float(v) for v in self.uavPosENU)
+                if post_arm_yaw_rate_rad_s is None:
+                    with self._lock:
+                        yaw = float(self.uavYawENU)
+                    self._update_setpoint(
+                        type_mask=self._MASK_POSITION_YAW,
+                        vx=x, vy=y, vz=z,
+                        yaw=yaw, yaw_rate=0.0,
+                    )
+                    handoff_text = f"yaw_hold={math.degrees(yaw):.1f}deg"
+                else:
+                    self._update_setpoint(
+                        type_mask=self._MASK_POSITION_YAWRATE,
+                        vx=x, vy=y, vz=z,
+                        yaw=0.0,
+                        yaw_rate=float(post_arm_yaw_rate_rad_s),
+                    )
+                    handoff_text = f"yaw_rate={float(post_arm_yaw_rate_rad_s):.3f}rad/s"
                 self.stop_hold_stream()
+                logger.info(
+                    "[MAVROS] Post-arm position heartbeat: "
+                    "ENU=(%.2f,%.2f,%.2f) %s @ %.1fHz",
+                    x, y, z, handoff_text, self._setpoint_rate_hz,
+                )
                 return True
 
             if self.isOffboard and not self.isArmed:
@@ -676,6 +879,24 @@ class MAVROSController:
             yaw_rate=0.0,
         )
 
+    async def send_velocity_enu_yaw_rate(self, vx: float, vy: float, vz: float,
+                                          yaw_rate_rad_s: float = 0.0):
+        """发送 ENU 速度 + yaw_rate setpoint (角速度控制).
+
+        :param vx: 东向速度 (m/s, ENU)
+        :param vy: 北向速度 (m/s, ENU)
+        :param vz: 上向速度 (m/s, ENU, 正值=上升)
+        :param yaw_rate_rad_s: 偏航角速度 (rad/s, CCW+)
+        """
+        self._update_setpoint(
+            type_mask=self._MASK_VELOCITY_YAWRATE,
+            vx=float(vx),
+            vy=float(vy),
+            vz=float(vz),
+            yaw=0.0,
+            yaw_rate=float(yaw_rate_rad_s),
+        )
+
     async def send_position_enu_yaw(self, x: float, y: float, z: float,
                                      yaw_deg: float = 0.0):
         """发送 ENU 位置 + yaw setpoint.
@@ -693,6 +914,82 @@ class MAVROSController:
             vz=float(z),
             yaw=yaw_rad,
             yaw_rate=0.0,
+        )
+
+    async def send_position_enu_yaw_rate(self, x: float, y: float, z: float,
+                                          yaw_rate_rad_s: float = 0.0):
+        """发送 ENU 位置 + yaw_rate setpoint (位置控制 + 角速度偏航).
+
+        :param x: 东向 (m, ENU)
+        :param y: 北向 (m, ENU)
+        :param z: 上向 (m, ENU, 正值=上升)
+        :param yaw_rate_rad_s: 偏航角速度 (rad/s, CCW+)
+        """
+        self._update_setpoint(
+            type_mask=self._MASK_POSITION_YAWRATE,
+            vx=float(x),
+            vy=float(y),
+            vz=float(z),
+            yaw=0.0,
+            yaw_rate=float(yaw_rate_rad_s),
+        )
+
+    async def send_velocity_xy_position_z_enu_yaw_rate(
+        self, vx: float, vy: float, z: float,
+        yaw_rate_rad_s: float = 0.0,
+    ):
+        """发送 ENU 混合 setpoint：限速速度 XY + 高度位置 Z + yaw_rate。"""
+        self._update_mixed_setpoint(
+            type_mask=self._MASK_VELOCITY_XY_POSITION_Z_YAWRATE,
+            px=0.0,
+            py=0.0,
+            pz=float(z),
+            vx=float(vx),
+            vy=float(vy),
+            vz=0.0,
+            yaw=0.0,
+            yaw_rate=float(yaw_rate_rad_s),
+        )
+
+    async def send_position_xy_velocity_z_enu_yaw_rate(
+            self, x: float, y: float, vz: float,
+            yaw_rate_rad_s: float = 0.0):
+        """发送 ENU 混合 setpoint（位置 XY + 速度 Z + yaw_rate）。
+
+        PX4 锁定 XY 位置，以速度 vz 控制升降，同时以 yaw_rate 旋转。
+
+        :param x: 东向位置 (m, ENU)
+        :param y: 北向位置 (m, ENU)
+        :param vz: 上向速度 (m/s, ENU, 负值=下降)
+        :param yaw_rate_rad_s: 偏航角速度 (rad/s, CCW+)
+        """
+        self._update_setpoint(
+            type_mask=self._MASK_LANDING_YAWRATE,
+            vx=float(x),
+            vy=float(y),
+            vz=float(vz),
+            yaw=0.0,
+            yaw_rate=float(yaw_rate_rad_s),
+        )
+
+    async def send_position_xy_velocity_z_enu_yaw(
+            self, x: float, y: float, vz: float,
+            yaw_deg: float = 0.0):
+        """发送 ENU 混合 setpoint（位置 XY + 速度 Z + 固定 yaw）。"""
+        self._update_setpoint(
+            type_mask=self._MASK_POSITION_XY_VELOCITY_Z_YAW,
+            vx=float(x),
+            vy=float(y),
+            vz=float(vz),
+            yaw=math.radians(float(yaw_deg)),
+            yaw_rate=0.0,
+        )
+
+    async def send_landing_enu_yaw_rate(self, x: float, y: float, vz: float,
+                                         yaw_rate_rad_s: float = 0.0):
+        """兼容接口：固定 XY 并以速度 Z 降落。"""
+        await self.send_position_xy_velocity_z_enu_yaw_rate(
+            x, y, vz, yaw_rate_rad_s
         )
 
     # ------------------------------------------------------------------

@@ -87,12 +87,8 @@ def _semantic_generator_cfg(pcfg: dict) -> dict:
 # ============================================================
 
 def _get_rotation_body_from_lidar(cfg: dict) -> np.ndarray:
-    """从配置读取 R_body_from_lidar, 若不存在则用简单翻转 + pitch 构造."""
-    matrix_cfg = cfg.get("halss_lidar_rotation_body_from_lidar")
-    if matrix_cfg is not None:
-        return np.array(matrix_cfg, dtype=np.float32)
-
-    pitch_deg = float(cfg.get("halss_lidar_pitch_down_deg", 26.0))
+    """Raw-only diagnostic transform matching FAST-LIO's 116 degree mount."""
+    pitch_deg = 116.0
     pitch = np.deg2rad(pitch_deg)
     cp, sp = np.cos(pitch), np.sin(pitch)
     R_pitch = np.array([
@@ -100,12 +96,12 @@ def _get_rotation_body_from_lidar(cfg: dict) -> np.ndarray:
         [0,  1, 0],
         [-sp, 0, cp],
     ], dtype=np.float32)
-    R_flip = np.array([
+    R_axis = np.array([
         [1,  0,  0],
         [0, -1,  0],
         [0,  0, -1],
     ], dtype=np.float32)
-    return R_flip @ R_pitch
+    return R_axis @ R_pitch
 
 
 def raw_lidar_to_body_down_roi(

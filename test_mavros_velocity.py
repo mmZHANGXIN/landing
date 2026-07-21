@@ -11,7 +11,7 @@ Procedure:
 Pose source: /mavros/local_position/odom (ENU convention, same as setpoint convention)
 
 Usage:
-  python test_mavros_velocity.py --target-z 1.0
+  python test_mavros_velocity.py --yaw-rate-rad-s 0.5
 """
 
 import argparse
@@ -29,6 +29,7 @@ if str(_PROJECT_ROOT) not in sys.path:
 SETPOINT_RATE_HZ = 20.0
 OFFBOARD_WARMUP_S = 2.0
 MAVROS_NS = "/mavros"
+YAW_RATE_RAD_S = 0.0
 
 
 def _quat_to_yaw(x, y, z, w):
@@ -51,7 +52,7 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
         rospy.init_node("test_mavros_velocity", anonymous=False)
 
     _odom_lock = threading.Lock()
-    _odom_enu = None  # (x, y, z, yaw) raw ENU
+    _odom_enu = None  # (x, y, z, yaw, yaw_rate) raw ENU
 
     def _odom_cb(msg: Odometry):
         nonlocal _odom_enu
@@ -59,7 +60,10 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
         q = msg.pose.pose.orientation
         yaw = _quat_to_yaw(q.x, q.y, q.z, q.w)
         with _odom_lock:
-            _odom_enu = (float(p.x), float(p.y), float(p.z), yaw)
+            _odom_enu = (
+                float(p.x), float(p.y), float(p.z), yaw,
+                float(msg.twist.twist.angular.z),
+            )
 
     odom_sub = rospy.Subscriber(f"{MAVROS_NS}/local_position/odom", Odometry, _odom_cb, queue_size=10)
 
@@ -83,10 +87,19 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
         with _odom_lock:
             return _odom_enu
 
-    x0, y0, z0, yaw0 = _get_odom()
-    home_yaw_deg = math.degrees(yaw0)
+    # Capture the takeoff reference exactly once.  MAVROS local odometry is a
+    # metric ENU frame and its origin is not assumed to be (0, 0, 0).
+    takeoff_x, takeoff_y, takeoff_z, takeoff_yaw, _ = _get_odom()
+    takeoff_values = (takeoff_x, takeoff_y, takeoff_z, takeoff_yaw)
+    if not all(math.isfinite(value) for value in takeoff_values):
+        raise RuntimeError(f"invalid MAVROS local odometry: {takeoff_values}")
+    home_yaw_deg = math.degrees(takeoff_yaw)
     print(f"MAVROS connected. armed={fc.isArmed} mode={fc.flightMode} offboard={fc.isOffboard}")
-    print(f"odom (ENU): pos=[{x0:.2f},{y0:.2f},{z0:.2f}] yaw={home_yaw_deg:.0f}deg")
+    print(
+        "fixed takeoff point (local ENU): "
+        f"[{takeoff_x:.2f},{takeoff_y:.2f},{takeoff_z:.2f}] "
+        f"yaw={home_yaw_deg:.0f}deg"
+    )
 
     # --- 3. stream current position setpoint, wait for RC arm+OFFBOARD ---
     print("")
@@ -99,8 +112,9 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
 
     async def _hold_position():
         while hold_pos:
-            x, y, z, _ = _get_odom()
-            await fc.send_position_ned(x, y, z, home_yaw_deg)
+            await fc.send_position_enu_yaw(
+                takeoff_x, takeoff_y, takeoff_z, home_yaw_deg
+            )
             await asyncio.sleep(0.05)
 
     hold_task = asyncio.create_task(_hold_position())
@@ -121,12 +135,19 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
     except asyncio.CancelledError:
         pass
 
-    # --- 4. record home point ---
-    x0, y0, z0, yaw0 = _get_odom()
-    print(f"  home z={z0:.2f}m (ENU, up+)")
+    # Keep the takeoff yaw fixed until the target altitude is reached.
+    await fc.send_position_enu_yaw(
+        takeoff_x, takeoff_y, takeoff_z, home_yaw_deg
+    )
 
-    # --- 5. takeoff (velocity climb @ 2 m/s, ENU: vz positive = up) ---
-    CLIMB_SPEED = 2.0
+    # --- 4. use the fixed takeoff point captured before arming ---
+    print(
+        f"  takeoff reference: x={takeoff_x:.2f} y={takeoff_y:.2f} "
+        f"z={takeoff_z:.2f}m (local ENU, up+)"
+    )
+
+    # --- 5. takeoff (velocity climb @ 4.0 m/s, ENU: vz positive = up) ---
+    CLIMB_SPEED = 2.5
     print("")
     print("=" * 50)
     print(f"Takeoff to {target_z_m:.1f}m height @ {CLIMB_SPEED:.1f} m/s")
@@ -135,17 +156,21 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
     climb_start = time.perf_counter()
     last_log = 0.0
     while True:
-        _, _, cur_z, _ = _get_odom()
-        height_m = cur_z - z0
+        _, _, cur_z, _, _ = _get_odom()
+        height_m = cur_z - takeoff_z
 
         if height_m >= target_z_m:
             print(f">>> reached target height! {height_m:.2f}m elapsed={time.perf_counter() - climb_start:.1f}s")
             break
         if time.perf_counter() - climb_start > 15.0:
-            print(f"*** takeoff timeout 15s, height={height_m:.2f}m target={target_z_m:.2f}m")
-            break
+            raise TimeoutError(
+                "takeoff timeout 15s; yaw-rate was not started: "
+                f"height={height_m:.2f}m target={target_z_m:.2f}m"
+            )
 
-        await fc.send_velocity_ned_yaw(0.0, 0.0, CLIMB_SPEED, home_yaw_deg)
+        await fc.send_position_xy_velocity_z_enu_yaw(
+            takeoff_x, takeoff_y, CLIMB_SPEED, home_yaw_deg
+        )
 
         now = time.perf_counter()
         if now - last_log >= 0.5:
@@ -153,25 +178,47 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
             last_log = now
         await asyncio.sleep(0.05)
 
-    # stabilise with position hold
+    # Target altitude reached: start yaw-rate while holding the takeoff XY.
+    print(f"target height reached; starting yaw_rate={YAW_RATE_RAD_S:+.3f} rad/s")
     print("stabilising...")
-    target_z = z0 + target_z_m
+    target_z = takeoff_z + target_z_m
     for _ in range(int(1.0 / 0.1)):
-        await fc.send_position_ned(x0, y0, target_z, home_yaw_deg)
+        await fc.send_position_enu_yaw_rate(
+            takeoff_x, takeoff_y, target_z, YAW_RATE_RAD_S
+        )
         await asyncio.sleep(0.1)
 
-    # --- 6. hover (position hold) ---
+    # --- 6. hover (fixed XYZ + yaw-rate rotation) ---
     print("")
-    print(f"Hover {hover_s:.1f} sec ...")
+    print(
+        f"Hover {hover_s:.1f} sec @ {YAW_RATE_RAD_S:.1f} rad/s "
+        "yaw_rate (position+yaw-rate mode) ..."
+    )
     hover_start = time.perf_counter()
+    last_hover_log = 0.0
     while time.perf_counter() - hover_start < hover_s:
-        await fc.send_position_ned(x0, y0, target_z, home_yaw_deg)
-        await asyncio.sleep(0.5)
+        await fc.send_position_enu_yaw_rate(
+            takeoff_x, takeoff_y, target_z, YAW_RATE_RAD_S
+        )
+        now = time.perf_counter()
+        if now - last_hover_log >= 1.0:
+            cur_x, cur_y, cur_z, cur_yaw, measured_yaw_rate = _get_odom()
+            elapsed = now - hover_start
+            drift_xy = math.hypot(cur_x - takeoff_x, cur_y - takeoff_y)
+            sp = fc.get_setpoint_status()
+            print(
+                f"   hover z={cur_z:.2f}m xy_drift={drift_xy:.2f}m "
+                f"yaw={math.degrees(cur_yaw):.0f}deg "
+                f"yawrate(cmd/meas)={YAW_RATE_RAD_S:+.3f}/{measured_yaw_rate:+.3f}rad/s "
+                f"sp_rate={sp['publish_rate_hz']:.1f}Hz elapsed={elapsed:.1f}s"
+            )
+            last_hover_log = now
+        await asyncio.sleep(0.1)
     print("hover complete")
 
     # --- 7. land (velocity descent, ENU: vz negative = down) ---
-    DESCENT_SPEED = 0.5
-    land_z = z0 + land_z_m
+    DESCENT_SPEED = 2.5
+    land_z = takeoff_z + land_z_m
     print("")
     print("=" * 50)
     print(f"Land to {land_z_m:.1f}m height @ {DESCENT_SPEED:.1f} m/s")
@@ -180,8 +227,8 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
     land_start = time.perf_counter()
     last_land_log = 0.0
     while True:
-        _, _, cur_z, _ = _get_odom()
-        height_m = cur_z - z0
+        _, _, cur_z, _, _ = _get_odom()
+        height_m = cur_z - takeoff_z
         now = time.perf_counter()
         if now - last_land_log >= 0.5:
             print(f"   height={height_m:.2f}m target={land_z_m:.2f}m elapsed={now - land_start:.1f}s")
@@ -192,19 +239,25 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
         if time.perf_counter() - land_start > 15.0:
             print(f"*** land timeout 15s, height={height_m:.2f}m")
             break
-        await fc.send_velocity_ned_yaw(0.0, 0.0, -DESCENT_SPEED, home_yaw_deg)
+        await fc.send_position_xy_velocity_z_enu_yaw_rate(
+            takeoff_x, takeoff_y, -DESCENT_SPEED, YAW_RATE_RAD_S
+        )
         await asyncio.sleep(0.05)
 
     # stabilise near ground
     print("stabilising near ground...")
     for _ in range(int(1.0 / 0.1)):
-        await fc.send_position_ned(x0, y0, land_z, home_yaw_deg)
+        await fc.send_position_enu_yaw(
+            takeoff_x, takeoff_y, land_z, home_yaw_deg
+        )
         await asyncio.sleep(0.1)
 
     # --- 8. DISARM ---
     print("touchdown hover 1 sec...")
     for _ in range(10):
-        await fc.send_position_ned(x0, y0, land_z, home_yaw_deg)
+        await fc.send_position_enu_yaw(
+            takeoff_x, takeoff_y, land_z, home_yaw_deg
+        )
         await asyncio.sleep(0.1)
 
     print("disarming (DISARM)...")
@@ -224,15 +277,32 @@ async def test_mavros_position(target_z_m, tol_z_m, hover_s, land_z_m):
 
 def main():
     parser = argparse.ArgumentParser(description="MAVROS position control takeoff->hover->land test")
-    parser.add_argument("--target-z", type=float, default=1.0, help="takeoff height (m), default 1.0")
+    parser.add_argument("--target-z", type=float, default=1.5, help="takeoff height (m), default 1.5")
     parser.add_argument("--tol-z", type=float, default=0.15, help="Z tolerance (m), default 0.15")
-    parser.add_argument("--hover", type=float, default=2.0, help="hover time (s), default 2.0")
+    parser.add_argument("--hover", type=float, default=10.0, help="hover time (s), default 10.0")
     parser.add_argument("--land-z", type=float, default=0.2, help="land height (m), default 0.2")
     parser.add_argument("--mavros-ns", type=str, default="/mavros")
+    parser.add_argument(
+        "--config", default=str(_PROJECT_ROOT / "config" / "experiment_indoor_fastlio.yaml"),
+        help="Indoor experiment config used for the default yaw rate",
+    )
+    parser.add_argument("--yaw-rate-rad-s", type=float, default=None)
     args = parser.parse_args()
+
+    from pipeline import _load_config
+    cfg = _load_config(args.config)
+    yaw_rate = (
+        float(args.yaw_rate_rad_s)
+        if args.yaw_rate_rad_s is not None
+        else float(cfg.get("uav", {}).get("yaw_rate_rad_s", 0.0))
+    )
+    if not math.isfinite(yaw_rate) or abs(yaw_rate) > 5.0:
+        parser.error("--yaw-rate-rad-s must be finite and within [-5.0, 5.0]")
 
     global MAVROS_NS
     MAVROS_NS = args.mavros_ns
+    global YAW_RATE_RAD_S
+    YAW_RATE_RAD_S = yaw_rate
 
     print("=" * 60)
     print(" MAVROS Position Control Test")
@@ -240,6 +310,7 @@ def main():
     print(f"  target height: {args.target_z:.1f} m")
     print(f"  tol Z:         {args.tol_z:.2f} m")
     print(f"  hover:         {args.hover:.1f} s")
+    print(f"  yaw rate:      {YAW_RATE_RAD_S:+.3f} rad/s")
     print(f"  MAVROS NS:     {MAVROS_NS}")
     print("=" * 60)
     print("")

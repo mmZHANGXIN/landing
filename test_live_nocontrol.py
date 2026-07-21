@@ -36,8 +36,35 @@ def _top_probs(probs, action_names=None, k: int = 3) -> str:
 
 # ------------------------------ config ------------------------------
 import yaml
-with open(os.path.join(os.path.dirname(__file__), "config", "experiment_config.yaml")) as f:
-    CFG = yaml.safe_load(f)
+_EARLY_PARSER = argparse.ArgumentParser(add_help=False)
+_EARLY_PARSER.add_argument(
+    "--config",
+    default=os.path.join(os.path.dirname(__file__), "config", "experiment_config.yaml"),
+)
+_EARLY_ARGS, _ = _EARLY_PARSER.parse_known_args()
+
+
+def _load_profile(path):
+    path = os.path.abspath(path)
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    parent = cfg.pop("extends", None)
+    if not parent:
+        return cfg
+    base = _load_profile(os.path.join(os.path.dirname(path), parent))
+
+    def merge(dst, src):
+        for key, value in src.items():
+            if isinstance(value, dict) and isinstance(dst.get(key), dict):
+                merge(dst[key], value)
+            else:
+                dst[key] = value
+        return dst
+
+    return merge(base, cfg)
+
+
+CFG = _load_profile(_EARLY_ARGS.config)
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -47,6 +74,10 @@ import rospy
 from perception.halss_bayesian import HALSSBayesianEvaluator
 from perception.halss_preprocess import world_to_level_body_roi
 from perception.semantic_generator import SemanticGenerator
+from perception.training_camera_projection import (
+    TrainingCameraModel,
+    project_training_camera,
+)
 
 # ---- 里程计 ----
 from odometry import FastLIOInterface
@@ -76,6 +107,8 @@ logger.info(f"ActionDecomposer (sign={ACTION_SIGN}): {ACTION_NAMES_DECOMP}")
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="No-control live Orin landing pipeline test")
+    parser.add_argument("--config", default=_EARLY_ARGS.config,
+                        help="Experiment profile used by the perception pipeline")
     parser.add_argument("--yaw-rate-rad-s", type=float, default=None,
                         help="Override uav.yaw_rate_rad_s for this no-control run")
     parser.add_argument("--save-raw-arrays", action="store_true",
@@ -307,14 +340,46 @@ def make_binary_semantic_vis(sem_map, safe_id=1, danger_id=9):
     return sem_vis
 
 
+def compute_roi_half_from_height(pose_z_world, ground_z_world, projection_mode,
+                                 training_camera, roi_fov_half_rad,
+                                 roi_min_half, roi_max_half,
+                                 halss_points=None, roi_height_source="pose_z"):
+    """Compute dynamic ROI half-extent from current height above ground.
+
+    For training_camera mode, uses the camera's rectangular FOV to compute
+    separate forward/lateral half-extents.  For level_body_bev, uses a
+    symmetric square FOV cone.
+
+    Returns (half_x, half_y, height_m).
+    """
+    if roi_height_source == "pointcloud_median":
+        if halss_points is not None and len(halss_points) > 10:
+            H = float(np.median(np.asarray(halss_points, dtype=np.float32)[:, 2]))
+        else:
+            H = abs(float(pose_z_world) - ground_z_world)
+    else:
+        H = abs(float(pose_z_world) - ground_z_world)
+    H = max(H, 0.1)
+    if projection_mode == "training_camera":
+        half_x, half_y = training_camera.ground_half_extents(H)
+        half_x = max(roi_min_half, min(roi_max_half, half_x))
+        half_y = max(roi_min_half, min(roi_max_half, half_y))
+        return half_x, half_y, H
+    half = H * np.tan(roi_fov_half_rad)
+    half_clamped = max(roi_min_half, min(roi_max_half, half))
+    return half_clamped, half_clamped, H
+
+
 # ============================================================
 # ONNX DRL 推理器
 # ============================================================
 
 class ONNXDRL:
-    """轻量 ONNX DRL 推理 (从 TF1 PPO2 导出)."""
+    """轻量 ONNX DRL 推理 (从 TF1 PPO2 导出), 与 pipeline.py 对齐."""
 
-    def __init__(self, onnx_path, obs_h=128, obs_w=128, dmax=30.0):
+    def __init__(self, onnx_path, obs_h=128, obs_w=128, dmax=30.0,
+                 depth_norm_mode="raw_meters_graph_scaled",
+                 semantic_norm_mode="raw_gray_graph_scaled"):
         if not HAS_ONNX:
             raise ImportError("pip install onnxruntime")
         opts = ort.SessionOptions()
@@ -332,6 +397,18 @@ class ONNXDRL:
             self.layout = "hwc"
         self.obs_h, self.obs_w = obs_h, obs_w
         self.dmax = dmax
+        self.depth_norm_mode = depth_norm_mode
+        self.semantic_norm_mode = semantic_norm_mode
+        if self.depth_norm_mode != "raw_meters_graph_scaled":
+            raise ValueError(
+                "ONNX graph already contains input/truediv; use "
+                "observation.depth_norm_mode=raw_meters_graph_scaled"
+            )
+        if self.semantic_norm_mode != "raw_gray_graph_scaled":
+            raise ValueError(
+                "ONNX graph already contains input/truediv; use "
+                "observation.semantic_norm_mode=raw_gray_graph_scaled"
+            )
 
         dummy = np.zeros((1, obs_h, obs_w, 2), dtype=np.float32)
         self._forward(dummy)
@@ -345,10 +422,12 @@ class ONNXDRL:
         return self.session.run([self.output_name], {self.input_name: inp})[0]
 
     def predict(self, depth_map, sem_map, flip_lr=False, flip_ud=False):
-        """深度图 + 语义图 -> 动作索引 0-9 + 诊断信息."""
+        """深度图 + 语义图 -> 动作索引 0-9 + 诊断信息 (与 pipeline.py 对齐)."""
         depth_clipped = np.clip(
             np.nan_to_num(depth_map, nan=self.dmax, posinf=self.dmax, neginf=0.0),
             0.0, self.dmax)
+        # The exported graph contains SB2 policy scale=True as input/truediv.
+        # Feed the same raw Box(0,255) values used by training exactly once.
         depth_ch = depth_clipped.astype(np.float32)
 
         sem_int = np.clip(sem_map, -1, 9).astype(np.int16)
@@ -367,10 +446,13 @@ class ONNXDRL:
         obs = np.expand_dims(obs, axis=0)
 
         logits = self._forward(obs)
-        action = int(np.argmax(logits[0]))
-        l = logits[0]
-        e = np.exp(l - l.max())
-        probs = e / e.sum()
+        logits = np.asarray(logits[0], dtype=np.float32)
+        action = int(np.argmax(logits))
+        exps = np.exp(logits - float(np.max(logits)))
+        probs = exps / max(float(np.sum(exps)), 1e-12)
+
+        depth_after_graph_scale = depth_ch / 255.0
+        sem_after_graph_scale = sem_ch / 255.0
 
         info = {
             "depth_raw_median": float(np.median(depth_map)),
@@ -384,8 +466,17 @@ class ONNXDRL:
             "obs_raw_min": float(obs.min()),
             "obs_raw_max": float(obs.max()),
             "softmax_probs": probs.astype(float).tolist(),
+            "action_probs": probs.astype(float).tolist(),
+            "confidence": float(np.max(probs)),
+            "depth_norm_min": float(depth_after_graph_scale.min()),
+            "depth_norm_mean": float(depth_after_graph_scale.mean()),
+            "depth_norm_max": float(depth_after_graph_scale.max()),
+            "sem_norm_min": float(sem_after_graph_scale.min()),
+            "sem_norm_mean": float(sem_after_graph_scale.mean()),
+            "sem_norm_max": float(sem_after_graph_scale.max()),
+            "logits": logits.astype(float).tolist(),
         }
-        return action, logits[0], info
+        return action, logits, info
 
     def action_name(self, action_id):
         return ACTION_NAMES_DECOMP[action_id] if 0 <= action_id < len(ACTION_NAMES_DECOMP) else "?"
@@ -537,6 +628,34 @@ def main():
     sem_gen = SemanticGenerator(pcfg)
     logger.info("HALSS + SemanticGenerator OK")
 
+    # ---- 深度投影模式 (与 pipeline.py 对齐) ----
+    depth_cfg = CFG.get("depth_projection", {})
+    projection_mode = str(depth_cfg.get("mode", "training_camera")).lower()
+    if projection_mode not in ("training_camera", "level_body_bev"):
+        logger.warning(
+            "Unknown depth_projection.mode=%s, falling back to training_camera",
+            projection_mode,
+        )
+        projection_mode = "training_camera"
+    training_camera = TrainingCameraModel.from_config(
+        depth_cfg.get("training_camera", {}),
+        output_width=sz,
+        output_height=sz,
+        far_m=dmax,
+    )
+    danger_id = int(pcfg.get("danger_class_id", 9))
+    safe_id = int(pcfg.get("safe_class_id", 1))
+    logger.info("Projection mode: %s", projection_mode)
+    if projection_mode == "training_camera":
+        logger.info(
+            "  TrainingCamera: FOV=%.1fx%.1fdeg "
+            "scaled_intrinsics=fx=%.3f fy=%.3f cx=%.3f cy=%.3f",
+            training_camera.horizontal_fov_deg,
+            training_camera.vertical_fov_deg,
+            training_camera.fx, training_camera.fy,
+            training_camera.cx, training_camera.cy,
+        )
+
     onnx_path = args.onnx_model
     if not os.path.exists(onnx_path):
         logger.error(f"ONNX model not found: {onnx_path}")
@@ -558,7 +677,7 @@ def main():
 
     print("Pipeline ready. Waiting for /cloud_registered + /Odometry...", flush=True)
     logger.info("Pipeline ready. Waiting for FAST-LIO data...")
-    logger.info("  Depth backend: NN-fill (geometry)")
+    logger.info("  Depth backend: %s + NN-fill", projection_mode)
     logger.info("  DRL backend:   ONNX (raw input: depth=meters, sem=gray; ONNX internal /255)")
     logger.info("  Control:       NONE (print only)")
     logger.info("  Overrides:     %s", override_str)
@@ -574,7 +693,8 @@ def main():
     last_wait_log = 0.0
     half_x = float(CFG.get("perception", {}).get("halss_roi_half_x_m", 5.0))
     half_y = float(CFG.get("perception", {}).get("halss_roi_half_y_m", 5.0))
-    logger.info("  ROI: x∈[-%.1f,%.1f]m y∈[-%.1f,%.1f]m", half_x, half_x, half_y, half_y)
+    logger.info("  ROI: x∈[-%.1f,%.1f]m y∈[-%.1f,%.1f]m (mode=%s)",
+                half_x, half_x, half_y, half_y, projection_mode)
 
     # ---- 动态 FOV ROI 参数 ----
     roi_dynamic = bool(CFG.get("perception", {}).get("halss_roi_dynamic_enabled", True))
@@ -643,31 +763,23 @@ def main():
             if ground_z_world is None:
                 ground_z_world = float(pose_xyz[2])
             if roi_dynamic:
-                if roi_height_src == "pointcloud_median":
-                    # 先用静态 bounds 取一个粗 ROI 来估计高度
-                    _rough, _ = world_to_level_body_roi(
-                        pts, pose_xyz, rpy, pcfg, half_x=half_x, half_y=half_y,
-                    )
-                    if len(_rough) > 10:
-                        H = float(np.median(_rough[:, 2]))
-                    else:
-                        H = abs(float(pose_xyz[2]) - ground_z_world)
-                else:
-                    H = abs(float(pose_xyz[2]) - ground_z_world)
-                H = max(H, 0.1)
-                cur_half = H * np.tan(roi_fov_half_rad)
-                cur_half = max(roi_min_half, min(roi_max_half, cur_half))
+                cur_half_x, cur_half_y, _dyn_h = compute_roi_half_from_height(
+                    float(pose_xyz[2]), ground_z_world, projection_mode,
+                    training_camera, roi_fov_half_rad,
+                    roi_min_half, roi_max_half,
+                    halss_points=None, roi_height_source=roi_height_src,
+                )
             else:
-                cur_half = half_x
+                cur_half_x, cur_half_y = half_x, half_y
 
             # 1. HALSS 贝叶斯安全语义: 世界系点云 -> 水平机体动态 ROI
             halss_pts, halss_stats = world_to_level_body_roi(
                 pts, pose_xyz, rpy, pcfg,
-                half_x=cur_half, half_y=cur_half,
+                half_x=cur_half_x, half_y=cur_half_y,
             )
             roi_bounds = {
-                "x_min": -cur_half, "x_max": cur_half,
-                "y_min": -cur_half, "y_max": cur_half,
+                "x_min": -cur_half_x, "x_max": cur_half_x,
+                "y_min": -cur_half_y, "y_max": cur_half_y,
             }
             bev = halss.evaluate(halss_pts, fixed_bounds=roi_bounds)
 
@@ -676,34 +788,48 @@ def main():
                 bev_data = bev.get("bev_data", bev) if isinstance(bev, dict) else bev
                 sem_map = sem_gen.generate(bev_data)
             else:
-                sem_map = np.full((sz, sz), pcfg["danger_class_id"], dtype=np.uint8)
+                sem_map = np.full((sz, sz), danger_id, dtype=np.uint8)
 
-            # 3. BEV 稀疏深度 + 共享 bbox
-            sparse_depth, bounds = project_bev_depth(
-                halss_pts,
-                grid_res=pcfg.get("halss_grid_res", 64),
-                out_size=sz,
-                max_range=dmax,
-                half_x=cur_half,
-                half_y=cur_half)
-            valid_mask = (sparse_depth < dmax) & (sparse_depth > 0.01)
-
-            # 3b. 点云画布 (与深度图共用 bbox)
-            pc_canvas = project_pointcloud_canvas(halss_pts, bounds, out_size=sz, dmax=dmax)
+            # 3. 深度投影 + 语义投影 (与 pipeline.py 对齐: 支持 training_camera / level_body_bev)
+            semantic_valid_mask = np.ones_like(sem_map, dtype=bool)
+            if projection_mode == "training_camera":
+                sparse_depth, valid_mask, sem_map, semantic_valid_mask = (
+                    project_training_camera(
+                        halss_pts, sem_map, roi_bounds, training_camera,
+                        danger_id=danger_id,
+                    )
+                )
+                # 点云画布 (用 roi_bounds)
+                pc_canvas = project_pointcloud_canvas(
+                    halss_pts, roi_bounds, out_size=sz, dmax=dmax,
+                )
+            else:
+                sparse_depth, bounds = project_bev_depth(
+                    halss_pts,
+                    grid_res=pcfg.get("halss_grid_res", 64),
+                    out_size=sz,
+                    max_range=dmax,
+                    half_x=cur_half_x,
+                    half_y=cur_half_y,
+                )
+                valid_mask = (sparse_depth < dmax) & (sparse_depth > 0.01)
+                pc_canvas = project_pointcloud_canvas(
+                    halss_pts, bounds, out_size=sz, dmax=dmax,
+                )
 
             # 4. NN-fill 深度渲染
             rendered_depth = render_sparse_depth(sparse_depth, valid_mask, dmax)
 
             # ---- 诊断: semantic override ----
             if args.semantic_override == "all_safe":
-                sem_map_drl = np.full((sz, sz), pcfg["safe_class_id"], dtype=np.uint8)
+                sem_map_drl = np.full((sz, sz), safe_id, dtype=np.uint8)
             elif args.semantic_override == "all_danger":
-                sem_map_drl = np.full((sz, sz), pcfg["danger_class_id"], dtype=np.uint8)
+                sem_map_drl = np.full((sz, sz), danger_id, dtype=np.uint8)
             elif args.semantic_override == "center_safe":
-                sem_map_drl = np.full((sz, sz), pcfg["danger_class_id"], dtype=np.uint8)
+                sem_map_drl = np.full((sz, sz), danger_id, dtype=np.uint8)
                 c = sz // 2
                 r = sz // 4
-                sem_map_drl[c-r:c+r, c-r:c+r] = pcfg["safe_class_id"]
+                sem_map_drl[c-r:c+r, c-r:c+r] = safe_id
             else:
                 sem_map_drl = sem_map
 
@@ -741,18 +867,22 @@ def main():
                 end="",
             )
 
-            sem_safe_raw = int((sem_map == pcfg["safe_class_id"]).sum())
-            sem_danger_raw = int((sem_map == pcfg["danger_class_id"]).sum())
-            sem_safe_drl = int((sem_map_drl == pcfg["safe_class_id"]).sum())
-            sem_danger_drl = int((sem_map_drl == pcfg["danger_class_id"]).sum())
+            sem_safe_raw = int((sem_map == safe_id).sum())
+            sem_danger_raw = int((sem_map == danger_id).sum())
+            sem_safe_drl = int((sem_map_drl == safe_id).sum())
+            sem_danger_drl = int((sem_map_drl == danger_id).sum())
             binary_semantic_vis = make_binary_semantic_vis(
                 sem_map,
-                safe_id=pcfg["safe_class_id"],
-                danger_id=pcfg["danger_class_id"],
+                safe_id=safe_id,
+                danger_id=danger_id,
             )
+            # 训练相机模式下, 标记投影覆盖范围外的像素为未知 (灰色)
+            if projection_mode == "training_camera":
+                binary_semantic_vis[~semantic_valid_mask] = 128
             raw_arrays = {
                 "sparse_depth": sparse_depth.astype(np.float32),
                 "valid_mask": valid_mask.astype(np.uint8),
+                "semantic_valid_mask": semantic_valid_mask.astype(np.uint8),
                 "dense_depth": rendered_depth.astype(np.float32),
                 "sem_map": sem_map.astype(np.uint8),
                 "binary_semantic_vis": binary_semantic_vis.astype(np.uint8),

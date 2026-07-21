@@ -18,6 +18,7 @@ class MissionState(str, Enum):
     WAIT_LOCALIZATION = "WAIT_LOCALIZATION"
     READY = "READY"
     GOTO_SAFE = "GOTO_SAFE"
+    HOLD_FOR_MANUAL = "HOLD_FOR_MANUAL"
     DRL_DESCENT = "DRL_DESCENT"
     DIRECT_LAND = "DIRECT_LAND"
     LANDED = "LANDED"
@@ -182,6 +183,17 @@ class MissionStateManager:
 
         if self.state in (MissionState.LANDED, MissionState.ABORT, MissionState.EMERGENCY_STOP):
             return self._decision(previous, reason, height_m, ground_p05, ground_min, False)
+
+        if self.state == MissionState.HOLD_FOR_MANUAL:
+            if inputs.offboard_active is False:
+                self.state = MissionState.IDLE
+                reason = "manual_takeover"
+            elif inputs.armed is False:
+                self.state = MissionState.LANDED
+                reason = "disarmed_during_manual_hold"
+            self._last_reason = reason
+            return self._decision(previous, reason, height_m, ground_p05, ground_min,
+                                  previous != self.state)
 
         # --- XY boundary check (indoor safety, checked before other transitions) ---
         if self.boundary_enable and self.state in (

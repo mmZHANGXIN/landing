@@ -18,22 +18,25 @@ def iter_flight_ready_checks(cfg: dict, global_guidance_ready=None):
             "guidance would be skipped before DRL descent",
         )
 
-    yield _check_output_scale(cfg)
     yield _check_yaw_rate(cfg)
     yield _check_runtime_gpu(cfg)
     yield _check_module_gpu_requirements(cfg)
     yield _check_halss_backend(cfg)
     yield _check_depth_projection(cfg)
-    yield _check_depth_completion(cfg)
+    yield _check_policy_velocity(cfg)
     yield _check_action_frame(cfg)
     yield _check_action_lateral_sign(cfg)
     yield _check_mission_state(cfg)
     yield _check_localization_contract(cfg)
+    yield _check_localization_profile(cfg)
+    yield _check_outdoor_halss_ray_sampling(cfg)
+    yield _check_goto_speed_limit(cfg)
     yield _check_flight_controller(cfg)
     yield _check_fastlio_health_config(cfg)
     yield _check_observation_encoding(cfg)
     yield _check_visualization_enabled(cfg)
     yield _check_binary_semantic_window(cfg)
+    yield _check_recording_contract(cfg)
 
 
 def flight_ready_failures(cfg: dict, global_guidance_ready=None):
@@ -94,6 +97,17 @@ def _check_global_prior_from_config(cfg: dict):
                 "flight-ready gate: configured target_lat/target_lon must declare "
                 "global_prior.target_source='gis' to prove it came from nine-grid GIS risk assessment",
             )
+        try:
+            target_lat = float(gp.get("target_lat"))
+            target_lon = float(gp.get("target_lon"))
+        except (TypeError, ValueError):
+            return False, "flight-ready gate: target_lat/target_lon must be numeric"
+        if not (-90.0 <= target_lat <= 90.0 and -180.0 <= target_lon <= 180.0):
+            return (
+                False,
+                "flight-ready gate: target latitude/longitude outside valid ranges "
+                f"(lat={target_lat}, lon={target_lon})",
+            )
         target_alt = gp.get("target_altitude_m")
         if target_alt is None:
             return (
@@ -123,25 +137,30 @@ def _check_global_prior_from_config(cfg: dict):
     )
 
 
-def _check_output_scale(cfg: dict):
-    output_scale = cfg["depth_completion"].get("output_scale")
-    if output_scale is None:
-        return (
-            False,
-            "flight-ready gate: depth_completion.output_scale is null; calibrate "
-            "SparseNet scale before closing flight loop",
-        )
-    try:
-        output_scale = float(output_scale)
-    except (TypeError, ValueError):
-        return False, f"flight-ready gate: invalid output_scale={output_scale!r}"
-    if output_scale <= 0.0:
-        return False, f"flight-ready gate: output_scale must be positive, got {output_scale}"
-    return True, f"flight-ready gate: output_scale={output_scale:.6g}"
-
-
 def _check_yaw_rate(cfg: dict):
     yaw_rate = float(cfg["uav"].get("yaw_rate_rad_s", 0.0))
+    lcfg = cfg.get("localization", {})
+    if bool(lcfg.get("use_body_cloud", False)):
+        if abs(yaw_rate) > 1.0:
+            high_rate_test = cfg["uav"].get("high_yaw_rate_test_enabled") is True
+            if not high_rate_test:
+                return (
+                    False,
+                    "flight-ready gate: body-cloud validation limits yaw_rate_rad_s to <=1.0; "
+                    "pass --allow-high-yaw-rate-test for an explicit high-dynamic test",
+                )
+            if abs(yaw_rate) > 5.0:
+                return (
+                    False,
+                    "flight-ready gate: explicit high-dynamic yaw test limits "
+                    "yaw_rate_rad_s to <=5.0",
+                )
+            return (
+                True,
+                f"flight-ready gate: EXPLICIT HIGH-DYNAMIC body-cloud yaw test "
+                f"yaw_rate_rad_s={yaw_rate:.6g}",
+            )
+        return True, f"flight-ready gate: staged body-cloud yaw_rate_rad_s={yaw_rate:.6g}"
     if abs(yaw_rate) < 1e-6:
         return (
             False,
@@ -190,44 +209,37 @@ def _check_halss_backend(cfg: dict):
 
 def _check_depth_projection(cfg: dict):
     depth_cfg = cfg.get("depth_projection", {})
-    if depth_cfg.get("mode") != "perspective":
+    if depth_cfg.get("mode") != "training_camera":
         return (
             False,
-            "flight-ready gate: depth_projection.mode must be 'perspective' "
-            "for the down-looking camera projection formula",
+            "flight-ready gate: depth_projection.mode must be 'training_camera'",
         )
     backend = depth_cfg.get("backend")
-    if backend != "torch_cuda":
+    if backend != "numpy_opencv_nn_fill":
         return (
             False,
-            "flight-ready gate: depth_projection.backend must be 'torch_cuda' "
-            "so Mid360 depth projection/z-buffer runs on GPU",
+            "flight-ready gate: depth_projection.backend must be "
+            "'numpy_opencv_nn_fill' for the active live path",
         )
-    required = ("fx", "fy", "cx", "cy", "R_I_to_C")
-    missing = [key for key in required if depth_cfg.get(key) is None]
-    if missing:
-        return (
-            False,
-            "flight-ready gate: depth_projection missing intrinsics/extrinsics: "
-            + ",".join(missing),
-        )
-    return True, "flight-ready gate: perspective CUDA depth projection configured"
+    if float(depth_cfg.get("max_range", 0.0)) <= 0.0:
+        return False, "flight-ready gate: depth_projection.max_range must be positive"
+    return True, "flight-ready gate: training-camera projection + OpenCV NN-fill configured"
 
 
-def _check_depth_completion(cfg: dict):
-    dcfg = cfg.get("depth_completion", {})
-    if dcfg.get("backend") != "sparsity_invariant_cnn":
+def _check_policy_velocity(cfg: dict):
+    uav = cfg.get("uav", {})
+    try:
+        lateral = float(uav.get("vel_lateral"))
+        vertical = float(uav.get("vel_vertical"))
+    except (TypeError, ValueError):
+        return False, "flight-ready gate: uav policy velocities must be numeric"
+    if abs(lateral - 1.0) > 1e-6 or abs(vertical - 10.0) > 1e-6:
         return (
             False,
-            "flight-ready gate: depth_completion.backend must be 'sparsity_invariant_cnn'",
+            "flight-ready gate: policy action velocities must match training "
+            f"(lateral=1.0, vertical=10.0); got ({lateral}, {vertical})",
         )
-    if dcfg.get("input_encoding") != "inverse_unit":
-        return (
-            False,
-            "flight-ready gate: depth_completion.input_encoding must be 'inverse_unit' "
-            "to use x=1-D/dmax",
-        )
-    return True, "flight-ready gate: SparseNet inverse-depth completion configured"
+    return True, "flight-ready gate: action velocities match training (1.0/10.0 m/s)"
 
 
 def _check_action_frame(cfg: dict):
@@ -235,10 +247,16 @@ def _check_action_frame(cfg: dict):
     if frame != "body":
         return (
             False,
-            "flight-ready gate: uav.action_frame must be 'body' so DRL lateral "
-            "actions are rotated by the latest FAST-LIO yaw",
+            "flight-ready gate: uav.action_frame must be 'body' for ego-centric DRL actions",
         )
-    return True, "flight-ready gate: action_frame=body (yaw-compensated action mapping)"
+    yaw_source = str(cfg["uav"].get("execution_yaw_source", "px4_ekf")).lower()
+    if yaw_source != "px4_ekf":
+        return (
+            False,
+            "flight-ready gate: uav.execution_yaw_source must be 'px4_ekf' until "
+            "FAST-LIO world is explicitly aligned with PX4 ENU",
+        )
+    return True, "flight-ready gate: body action uses PX4 EKF yaw for execution"
 
 
 def _check_action_lateral_sign(cfg: dict):
@@ -260,22 +278,25 @@ def _check_observation_encoding(cfg: dict):
     obs = cfg["observation"]
     depth_mode = obs.get("depth_norm_mode")
     sem_mode = obs.get("semantic_norm_mode")
-    if depth_mode != "meters_div255" or sem_mode != "gray_unit":
+    if (depth_mode != "raw_meters_graph_scaled"
+            or sem_mode != "raw_gray_graph_scaled"):
         return (
             False,
-            "flight-ready gate: observation encoding must be DeepRL-compatible "
-            "(depth_norm_mode=meters_div255, semantic_norm_mode=gray_unit)",
+            "flight-ready gate: ONNX graph owns /255; external observation must be "
+            "raw_meters_graph_scaled + raw_gray_graph_scaled",
         )
-    return True, "flight-ready gate: observation encoding matches original DeepRL scale"
+    return True, "flight-ready gate: raw observation is normalized once inside ONNX"
 
 
 def _check_mission_state(cfg: dict):
     mcfg = cfg.get("mission_state", {})
-    if mcfg.get("height_source", "fastlio_z") != "fastlio_z":
+    mode = str(cfg.get("localization", {}).get("mode", "gps_px4_fastlio_perception")).lower()
+    expected_height = "px4_enu_z" if mode == "gps_px4_fastlio_perception" else "fastlio_z"
+    if mcfg.get("height_source", "fastlio_z") != expected_height:
         return (
             False,
-            "flight-ready gate: mission_state.height_source must be 'fastlio_z' "
-            "so direct-land switching uses gravity-calibrated localization height",
+            f"flight-ready gate: mission_state.height_source must be '{expected_height}' "
+            f"for localization mode {mode}",
         )
     if mcfg.get("height_axis", "neg_z") not in ("neg_z", "pos_z", "abs_z"):
         return (
@@ -306,23 +327,24 @@ def _check_mission_state(cfg: dict):
         return False, "flight-ready gate: ground_crosscheck_action must be 'warn' or 'block'"
     return (
         True,
-        "flight-ready gate: mission state uses Fast-LIO z with bounded direct-land thresholds",
+        f"flight-ready gate: mission state uses {expected_height} with bounded direct-land thresholds",
     )
 
 
 def _check_localization_contract(cfg: dict):
     lcfg = cfg.get("localization", {})
-    mode = lcfg.get("mode", "fastlio_external_vision")
-    if mode not in ("fastlio_external_vision", "mocap_external_vision"):
+    mode = lcfg.get("mode", "gps_px4_fastlio_perception")
+    if mode not in (
+        "gps_px4_fastlio_perception",
+        "fastlio_external_vision",
+        "mocap_external_vision",
+    ):
         return (
             False,
-            "flight-ready gate: localization.mode must be 'fastlio_external_vision' "
-            "or 'mocap_external_vision'",
+            "flight-ready gate: unsupported localization.mode",
         )
-    required = (
-        "fastlio_odom_topic", "world_cloud_topic",
-        "external_pose_topic", "local_odom_topic",
-    )
+    cloud_key = "body_cloud_topic" if mode == "gps_px4_fastlio_perception" else "world_cloud_topic"
+    required = ("fastlio_odom_topic", cloud_key, "local_odom_topic")
     missing = [key for key in required if not lcfg.get(key)]
     if missing:
         return (
@@ -360,36 +382,163 @@ def _check_localization_contract(cfg: dict):
     return True, f"flight-ready gate: localization contract configured ({mode})"
 
 
+def _check_localization_profile(cfg: dict):
+    """Keep PX4 fusion source, guidance mode and indoor boundary coupled."""
+    lcfg = cfg.get("localization", {})
+    mcfg = cfg.get("mission_state", {})
+    gp = cfg.get("global_prior", {})
+    mode = str(lcfg.get("mode", "gps_px4_fastlio_perception")).lower()
+    px4_source = str(lcfg.get("px4_position_source", "gps")).lower()
+    prior_mode = str(gp.get("mode", "gps")).lower()
+
+    if mode == "fastlio_external_vision":
+        failures = []
+        if px4_source != "external_vision":
+            failures.append("localization.px4_position_source=external_vision")
+        if prior_mode != "local_body_offset":
+            failures.append("global_prior.mode=local_body_offset")
+        if lcfg.get("allow_gps_fallback", False):
+            failures.append("localization.allow_gps_fallback=false")
+        if mcfg.get("boundary_enable") is not True:
+            failures.append("mission_state.boundary_enable=true")
+        if failures:
+            return False, "flight-ready gate: indoor profile requires " + ", ".join(failures)
+        try:
+            if not (
+                float(mcfg["boundary_x_min"]) < float(mcfg["boundary_x_max"])
+                and float(mcfg["boundary_y_min"]) < float(mcfg["boundary_y_max"])
+            ):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            return False, "flight-ready gate: indoor FAST-LIO boundary ranges are invalid"
+        return True, "flight-ready gate: indoor FAST-LIO external-vision profile is consistent"
+
+    if mode == "gps_px4_fastlio_perception":
+        if px4_source != "gps":
+            return False, "flight-ready gate: outdoor profile requires localization.px4_position_source=gps"
+        if prior_mode != "gps":
+            return False, "flight-ready gate: outdoor profile requires global_prior.mode=gps"
+        try:
+            max_gps_age_s = float(lcfg["max_gps_age_s"])
+            max_gps_hacc_m = float(lcfg["max_gps_horizontal_accuracy_m"])
+        except (KeyError, TypeError, ValueError):
+            return False, "flight-ready gate: outdoor profile requires numeric GPS health limits"
+        if not (0.1 <= max_gps_age_s <= 5.0):
+            return False, "flight-ready gate: localization.max_gps_age_s must be in [0.1, 5.0]"
+        if not (0.5 <= max_gps_hacc_m <= 20.0):
+            return False, "flight-ready gate: GPS horizontal accuracy limit must be in [0.5, 20.0]m"
+        return (
+            True,
+            "flight-ready gate: outdoor GPS profile is consistent "
+            f"(age<={max_gps_age_s:.1f}s hacc<={max_gps_hacc_m:.1f}m)",
+        )
+
+    return True, f"flight-ready gate: localization profile accepted ({mode})"
+
+
+def _check_goto_speed_limit(cfg: dict):
+    """Outdoor GOTO must carry its own bounded XY velocity setpoint."""
+    lcfg = cfg.get("localization", {})
+    gp = cfg.get("global_prior", {})
+    mode = str(lcfg.get("mode", "gps_px4_fastlio_perception")).lower()
+    if mode != "gps_px4_fastlio_perception":
+        return True, "flight-ready gate: outdoor GOTO speed limit not applicable"
+    try:
+        max_speed = float(gp["goto_max_horizontal_speed_mps"])
+        max_vertical_speed = float(gp.get("goto_max_vertical_speed_mps", 1.0))
+        kp_s = float(gp.get("goto_horizontal_kp_s", 1.0))
+    except (KeyError, TypeError, ValueError):
+        return (
+            False,
+            "flight-ready gate: outdoor profile requires numeric "
+            "global_prior.goto_max_horizontal_speed_mps",
+        )
+    if max_speed <= 0.0 or max_speed > 2.0:
+        return (
+            False,
+            "flight-ready gate: outdoor GOTO horizontal speed limit must be in (0, 2.0] m/s; "
+            f"got {max_speed:.3f}m/s",
+        )
+    if kp_s <= 0.0:
+        return False, "flight-ready gate: global_prior.goto_horizontal_kp_s must be > 0"
+    if max_vertical_speed <= 0.0 or max_vertical_speed > 1.0:
+        return False, "flight-ready gate: outdoor GOTO vertical speed limit must be in (0, 1.0] m/s"
+    if str(gp.get("goto_timeout_action", "")).lower() != "hold_for_manual":
+        return False, "flight-ready gate: outdoor GOTO timeout must use hold_for_manual"
+    return (
+        True,
+        f"flight-ready gate: outdoor GOTO speed capped at XY={max_speed:.2f}m/s Z={max_vertical_speed:.2f}m/s",
+    )
+
+
+def _check_outdoor_halss_ray_sampling(cfg: dict):
+    """Keep outdoor HALSS input bounded independently of flight altitude."""
+    lcfg = cfg.get("localization", {})
+    mode = str(lcfg.get("mode", "gps_px4_fastlio_perception")).lower()
+    if mode != "gps_px4_fastlio_perception":
+        return True, "flight-ready gate: outdoor HALSS ray sampling not applicable"
+    perception = cfg.get("perception", {})
+    if perception.get("halss_pinhole_ray_sampling_enabled") is not True:
+        return (
+            False,
+            "flight-ready gate: outdoor perception requires fixed pinhole ray sampling",
+        )
+    try:
+        ray_res = int(perception.get("halss_pinhole_ray_grid_res", 0))
+    except (TypeError, ValueError):
+        return False, "flight-ready gate: halss_pinhole_ray_grid_res must be numeric"
+    if ray_res != 64:
+        return (
+            False,
+            "flight-ready gate: outdoor HALSS pinhole ray grid must be 64x64; "
+            f"got {ray_res}x{ray_res}",
+        )
+    return (
+        True,
+        "flight-ready gate: outdoor HALSS input bounded by 64x64 nearest pinhole rays",
+    )
+
+
+def _check_recording_contract(cfg: dict):
+    recording = cfg.get("experiment_recording", {})
+    if recording.get("enabled") is not True or recording.get("required") is not True:
+        return False, "flight-ready gate: formal experiment rosbag must be enabled and required"
+    topics = set(recording.get("bag_topics", []))
+    required = {
+        "/livox/lidar", "/livox/imu", "/ali_cloud", "/ali_odom",
+        "/mavros/vision_pose/pose", "/mavros/local_position/odom",
+        "/mavros/global_position/global", "/mavros/imu/data",
+        "/mavros/state", "/mavros/extended_state",
+        "/mavros/setpoint_raw/local", "/mavros/setpoint_raw/target_local",
+    }
+    if str(cfg.get("localization", {}).get("mode", "")).lower() == "gps_px4_fastlio_perception":
+        required.update({"/cloud_registered_body", "/fastlio/degeneracy_metrics"})
+    missing = sorted(required - topics)
+    if missing:
+        return False, "flight-ready gate: rosbag missing replay topics: " + ",".join(missing)
+    return True, "flight-ready gate: rosbag covers raw, FAST-LIO, PX4 pose/yaw and setpoints"
+
+
 def _check_flight_controller(cfg: dict):
     """验证飞控后端配置."""
     fc_cfg = cfg.get("flight_controller", {})
     backend = str(fc_cfg.get("backend", "mavros")).lower()
 
-    if backend not in ("mavros", "mavsdk"):
+    if backend != "mavros":
         return (
             False,
-            f"flight-ready gate: flight_controller.backend must be 'mavros' or 'mavsdk'; got '{backend}'",
+            f"flight-ready gate: flight_controller.backend must be 'mavros'; got '{backend}'",
         )
 
-    if backend == "mavros":
-        mavros_ns = fc_cfg.get("mavros_ns", "/mavros")
-        if not mavros_ns.startswith("/"):
-            return (
-                False,
-                "flight-ready gate: flight_controller.mavros_ns must start with '/'",
-            )
-        rate = float(fc_cfg.get("setpoint_rate_hz", 20))
-        if rate < 5 or rate > 100:
-            return (
-                False,
-                f"flight-ready gate: setpoint_rate_hz must be in [5, 100]; got {rate}",
-            )
-        warmup = float(fc_cfg.get("offboard_warmup_s", 2.0))
-        if warmup < 0.5:
-            return (
-                False,
-                "flight-ready gate: offboard_warmup_s must be >= 0.5s for PX4 setpoint stream",
-            )
+    mavros_ns = fc_cfg.get("mavros_ns", "/mavros")
+    if not mavros_ns.startswith("/"):
+        return False, "flight-ready gate: flight_controller.mavros_ns must start with '/'"
+    rate = float(fc_cfg.get("setpoint_rate_hz", 20))
+    if rate < 5 or rate > 100:
+        return False, f"flight-ready gate: setpoint_rate_hz must be in [5, 100]; got {rate}"
+    warmup = float(fc_cfg.get("offboard_warmup_s", 2.0))
+    if warmup < 0.5:
+        return False, "flight-ready gate: offboard_warmup_s must be >= 0.5s"
 
     return True, f"flight-ready gate: flight controller backend={backend}"
 

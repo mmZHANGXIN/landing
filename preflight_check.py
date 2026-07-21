@@ -35,14 +35,31 @@ class CheckReport:
 
 
 def _load_config(path: Path):
+    path = path.resolve()
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f)
+            cfg = yaml.safe_load(f) or {}
     except ModuleNotFoundError as exc:
         if exc.name != "yaml":
             raise
-        return _load_simple_yaml(path)
+        cfg = _load_simple_yaml(path)
+    parent = cfg.pop("extends", None)
+    if parent:
+        parent_path = Path(parent)
+        if not parent_path.is_absolute():
+            parent_path = path.parent / parent_path
+        return _merge_dicts(_load_config(parent_path), cfg)
+    return cfg
+
+
+def _merge_dicts(base: dict, override: dict) -> dict:
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge_dicts(base[key], value)
+        else:
+            base[key] = value
+    return base
 
 
 def _strip_yaml_comment(line: str) -> str:
@@ -147,15 +164,9 @@ def check_config(cfg, report):
         ("perception", "require_gpu"),
         ("depth_projection", "mode"),
         ("depth_projection", "backend"),
-        ("depth_projection", "fx"),
-        ("depth_projection", "fy"),
-        ("depth_projection", "cx"),
-        ("depth_projection", "cy"),
-        ("depth_projection", "R_I_to_C"),
-        ("depth_completion", "backend"),
-        ("depth_completion", "weight_path"),
-        ("depth_completion", "input_encoding"),
-        ("decision", "policy_weights_path"),
+        ("depth_projection", "max_range"),
+        ("decision", "backend"),
+        ("decision", "onnx_model_path"),
         ("decision", "require_gpu"),
         ("uav", "action_frame"),
         ("uav", "action_lateral_sign"),
@@ -172,33 +183,26 @@ def check_config(cfg, report):
         else:
             report.ok(f"Config key present: {'.'.join(keys)}")
 
-    if cfg["depth_projection"].get("mode") != "perspective":
-        report.warn("depth_projection.mode is not 'perspective'; experiment formula path is disabled")
-    if cfg["depth_projection"].get("backend") != "torch_cuda":
-        report.warn("depth_projection.backend is not 'torch_cuda'; depth projection will not use GPU")
+    if cfg["depth_projection"].get("mode") != "training_camera":
+        report.warn("depth_projection.mode is not the active 'training_camera' path")
+    if cfg["depth_projection"].get("backend") != "numpy_opencv_nn_fill":
+        report.warn("depth_projection.backend is not the active OpenCV NN-fill path")
     if cfg["perception"].get("halss_backend") != "bayesian_unet":
         report.warn("perception.halss_backend is not 'bayesian_unet'; HALSS Bayesian path is disabled")
     if cfg["perception"].get("require_gpu") is not True:
         report.warn("perception.require_gpu is not true; HALSS may fall back to CPU")
     if cfg["decision"].get("require_gpu") is not True:
         report.warn("decision.require_gpu is not true; DRL policy may fall back to CPU")
-    if cfg["depth_completion"].get("input_encoding") != "inverse_unit":
-        report.warn("depth_completion.input_encoding is not 'inverse_unit'; expected x=1-D/dmax")
-    if cfg["depth_completion"].get("output_scale") is None:
-        report.warn(
-            "depth_completion.output_scale is null; converted SparseNet checkpoint is known "
-            "to be attenuated until calibrated"
-        )
     obs_cfg = cfg["observation"]
-    if obs_cfg.get("depth_norm_mode") != "meters_div255":
+    if obs_cfg.get("depth_norm_mode") != "raw_meters_graph_scaled":
         report.warn(
-            "observation.depth_norm_mode is not 'meters_div255'; compare against the original "
-            "DeepRL/SB2 scaled-depth convention before flight"
+            "observation.depth_norm_mode must feed raw metres because ONNX input/truediv "
+            "already performs the original SB2 /255"
         )
-    if obs_cfg.get("semantic_norm_mode") != "gray_unit":
+    if obs_cfg.get("semantic_norm_mode") != "raw_gray_graph_scaled":
         report.warn(
-            "observation.semantic_norm_mode is not 'gray_unit'; compare against original "
-            "DeepRL grayscale semantics before flight"
+            "observation.semantic_norm_mode must feed raw grayscale because ONNX "
+            "input/truediv already performs /255"
         )
     if cfg["uav"].get("action_frame") != "body":
         report.warn("uav.action_frame is not 'body'; yaw-fault body-frame compensation is disabled")
@@ -224,8 +228,8 @@ def check_flight_ready_config(cfg, report):
 def check_files(cfg, report):
     for label, path_value in [
         ("HALSS weight", cfg["perception"].get("halss_weight_path")),
-        ("SparseNet weight", cfg["depth_completion"].get("weight_path")),
-        ("DRL policy", cfg["decision"].get("policy_weights_path")),
+        ("ONNX DRL policy", cfg["decision"].get("onnx_model_path")),
+        ("ONNX metadata", cfg["decision"].get("onnx_meta_path")),
     ]:
         path = _resolve(path_value)
         if path and path.is_file():
@@ -235,7 +239,13 @@ def check_files(cfg, report):
 
     gp = cfg.get("global_prior", {})
     if gp.get("enabled"):
-        if gp.get("target_lat") is not None and gp.get("target_lon") is not None:
+        if str(gp.get("mode", "gps")).lower() == "local_body_offset":
+            offset = gp.get("local_body_offset_m")
+            if isinstance(offset, (list, tuple)) and len(offset) >= 3:
+                report.ok(f"Global prior uses indoor body offset {offset[:3]}")
+            else:
+                report.fail("Indoor global prior requires local_body_offset_m [forward,right,up]")
+        elif gp.get("target_lat") is not None and gp.get("target_lon") is not None:
             if gp.get("target_source") == "gis":
                 report.ok("Global prior uses GIS-derived configured GPS target")
             else:
@@ -257,21 +267,20 @@ def check_files(cfg, report):
 
 def check_drl_metadata(cfg, report):
     try:
-        from inspect_drl_model import inspect_sb3_zip
-        result = inspect_sb3_zip(_resolve(cfg["decision"].get("policy_weights_path")))
+        import json
+        path = _resolve(cfg["decision"].get("onnx_meta_path"))
+        result = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         report.warn(f"DRL metadata inspection failed: {exc}")
         return
-
-    for failure in result.get("failures", []):
-        report.fail(f"DRL metadata: {failure}")
-    for warning in result.get("warnings", []):
-        report.warn(f"DRL metadata: {warning}")
-    if not result.get("failures"):
-        report.ok(
-            "DRL metadata readable: "
-            f"shape={result.get('shape')} normalize_images={result.get('normalize_images')}"
-        )
+    shape = result.get("onnx_input_shape")
+    normalization = str(result.get("normalization", ""))
+    if shape != [-1, 128, 128, 2]:
+        report.fail(f"DRL metadata input shape mismatch: {shape}")
+    elif "255" not in normalization:
+        report.fail(f"DRL metadata normalization is not obs/255: {normalization!r}")
+    else:
+        report.ok(f"ONNX metadata matches input contract: shape={shape}, {normalization}")
 
 
 def check_cuda(report, required: bool = True):
@@ -294,29 +303,13 @@ def check_cuda(report, required: bool = True):
 
 
 def check_depth_projection(cfg, report):
-    import numpy as np
-    from perception.depth_projection import DepthProjector
-
     dcfg = cfg["depth_projection"]
-    projector = DepthProjector(
-        img_width=int(dcfg.get("grid_cells", 128)),
-        img_height=int(dcfg.get("grid_cells", 128)),
-        max_range=float(dcfg.get("max_range", 30.0)),
-        mode=dcfg.get("mode", "perspective"),
-        backend=dcfg.get("backend", "numpy"),
-        fx=dcfg.get("fx"),
-        fy=dcfg.get("fy"),
-        cx=dcfg.get("cx"),
-        cy=dcfg.get("cy"),
-        R_I_to_C=dcfg.get("R_I_to_C"),
-    )
-    points = np.array([[0.0, 0.0, 5.0], [1.0, 0.0, 5.0], [0.0, 1.0, 5.0]], dtype=np.float32)
-    pose = np.zeros(6, dtype=np.float32)
-    depth = projector.project(points, pose)
-    if depth.shape == (128, 128) and np.isclose(depth[63, 63], 5.0):
-        report.ok("Depth projection geometry sanity check passed")
+    grid = int(dcfg.get("grid_cells", 0))
+    dmax = float(dcfg.get("max_range", 0.0))
+    if grid == 128 and dmax > 0.0:
+        report.ok("Active BEV/NN-fill depth configuration sanity check passed")
     else:
-        report.fail(f"Depth projection sanity failed: shape={depth.shape}, center={depth[63, 63]}")
+        report.fail(f"Depth configuration invalid: grid_cells={grid}, max_range={dmax}")
 
 
 def check_action_decomposer(cfg, report):
@@ -345,35 +338,16 @@ def check_models(cfg, report, torch):
         report.warn("Skipping model load checks because CUDA/torch is unavailable")
         return
 
-    from perception.sparse_depth_completion import DepthCompletion
-    from rl.rl_agent import RLAgent
-
     try:
-        depth_cfg = dict(cfg["depth_completion"])
-        depth_cfg["weight_path"] = str(_resolve(depth_cfg.get("weight_path")))
-        dc = DepthCompletion(depth_cfg)
-        if dc.weights_ready and dc.warm:
-            report.ok("SparseNet DepthCompletion loads, validates, and warms up")
+        import onnxruntime as ort
+        session = ort.InferenceSession(str(_resolve(cfg["decision"]["onnx_model_path"])))
+        input_shape = session.get_inputs()[0].shape
+        if len(input_shape) == 4:
+            report.ok(f"ONNX DRL policy loads: input={input_shape}")
         else:
-            report.fail("SparseNet DepthCompletion did not report ready/warm")
+            report.fail(f"Unexpected ONNX input shape: {input_shape}")
     except Exception as exc:
-        report.fail(f"SparseNet DepthCompletion check failed: {exc}")
-
-    try:
-        agent = RLAgent(
-            str(_resolve(cfg["decision"]["policy_weights_path"])),
-            img_size=(cfg["observation"]["img_width"], cfg["observation"]["img_height"]),
-            dmax=cfg["depth_projection"]["max_range"],
-            depth_norm_mode=cfg["observation"].get("depth_norm_mode", "meters_div255"),
-            semantic_norm_mode=cfg["observation"].get("semantic_norm_mode", "gray_unit"),
-            require_gpu=bool(cfg["decision"].get("require_gpu", True)),
-        )
-        if agent.model is None:
-            report.fail("DRL model load failed; RLAgent fell back to dummy policy")
-        else:
-            report.ok("DRL SB3 policy loads")
-    except Exception as exc:
-        report.fail(f"DRL model check failed: {exc}")
+        report.fail(f"ONNX DRL model check failed: {exc}")
 
 
 def main():

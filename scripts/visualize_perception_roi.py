@@ -71,7 +71,6 @@ LIDAR_POS_BODY = np.array(
     PERC_CFG.get("halss_lidar_position_body_m", [0.13, 0.0, 0.08]),
     dtype=np.float32,
 )
-LIDAR_PITCH_DEG = float(PERC_CFG.get("halss_lidar_pitch_down_deg", 26.0))
 LIDAR_YAW_OFFSET_DEG = float(PERC_CFG.get("halss_lidar_yaw_offset_deg", 0.0))
 
 SAFE_ID = int(PERC_CFG.get("safe_class_id", 1))
@@ -345,7 +344,7 @@ def live_display(fastlio: FastLIOInterface, save_dir: str = None, max_frames: in
             f"yaw_only:        {YAW_ONLY}",
             f"world_z_up:      {WORLD_Z_UP}",
             f"lidar_pos_body:  {_fmt_v(LIDAR_POS_BODY)} m",
-            f"lidar_pitch:     {LIDAR_PITCH_DEG}°",
+            "lidar_extrinsic:  applied once by FAST-LIO mid360.yaml",
             f"lidar_yaw_off:   {LIDAR_YAW_OFFSET_DEG}°",
             "",
             "=== Current Frame ===",

@@ -1,10 +1,11 @@
 """HALSS input preprocessing for ego-centered down-looking maps.
 
-Two ROI modes are supported:
+Three ROI modes are supported:
+  - body_cloud_to_level_body_roi() -- outdoor deskewed body cloud + PX4 roll/pitch
   - world_to_body_down_roi()  -- legacy dynamic-radius body-down ROI (deprecated for flight)
-  - world_to_level_body_roi() -- fixed 10m×10m horizontal body ROI (current flight standard)
+  - world_to_level_body_roi() -- indoor FAST-LIO world-cloud route
 
-The flight pipeline and no-control test both use world_to_level_body_roi().
+The outdoor flight pipeline uses body_cloud_to_level_body_roi().
 """
 
 from __future__ import annotations
@@ -46,6 +47,89 @@ def _cfg_vec3(cfg: dict, key: str, default) -> np.ndarray:
     if arr.shape != (3,):
         raise ValueError(f"{key} must be a 3-element vector")
     return arr
+
+
+def _cfg_mat3(cfg: dict, key: str, default) -> np.ndarray:
+    value = cfg.get(key, default)
+    arr = np.asarray(value, dtype=np.float32)
+    if arr.size != 9:
+        raise ValueError(f"{key} must contain 9 values")
+    return arr.reshape(3, 3)
+
+
+def body_cloud_to_level_body_roi(
+    points_lidar_imu: np.ndarray,
+    roll_rad: float,
+    pitch_rad: float,
+    cfg: dict,
+    half_x: float = None,
+    half_y: float = None,
+) -> tuple[np.ndarray, dict]:
+    """Convert FAST-LIO ``/cloud_registered_body`` into a level body ROI.
+
+    ``/cloud_registered_body`` is motion-undistorted and expressed at the
+    Mid360 IMU origin.  It does not require the accumulated FAST-LIO world
+    position.  The configured rigid transform moves it into ``base_link``;
+    PX4 roll/pitch then level the cloud while yaw intentionally remains in the
+    aircraft frame (x=forward, y=lateral, z=down).
+    """
+    half_x = float(half_x if half_x is not None else cfg.get("halss_roi_half_x_m", 5.0))
+    half_y = float(half_y if half_y is not None else cfg.get("halss_roi_half_y_m", 5.0))
+    min_down = float(cfg.get("halss_min_down_m", 0.05))
+    max_down = float(cfg.get("halss_max_down_m", cfg.get("halss_roi_max_down_m", 30.0)))
+    stats = {
+        "input_points": 0,
+        "output_points": 0,
+        "finite_ratio": 0.0,
+        "roi_type": "deskewed_body_level",
+        "roi_x_range": [-half_x, half_x],
+        "roi_y_range": [-half_y, half_y],
+        "z_min_body": float("nan"),
+        "z_max_body": float("nan"),
+    }
+    if points_lidar_imu is None:
+        return np.empty((0, 3), dtype=np.float32), stats
+
+    pts = np.asarray(points_lidar_imu, dtype=np.float32)
+    if pts.ndim != 2 or pts.shape[1] < 3:
+        raise ValueError("points_lidar_imu must have shape (N,3) or (N,>=3)")
+    pts = pts[:, :3]
+    stats["input_points"] = int(len(pts))
+    if len(pts) == 0:
+        return np.empty((0, 3), dtype=np.float32), stats
+
+    finite = np.isfinite(pts).all(axis=1)
+    stats["finite_ratio"] = float(np.mean(finite))
+    pts = pts[finite]
+    if len(pts) == 0:
+        return np.empty((0, 3), dtype=np.float32), stats
+
+    r_body_from_imu = _cfg_mat3(
+        cfg,
+        "body_R_from_lidar_imu",
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+    )
+    t_body_from_imu = _cfg_vec3(cfg, "body_T_from_lidar_imu", [0.0, 0.0, 0.0])
+    pts_body = pts @ r_body_from_imu.T + t_body_from_imu
+
+    # Body -> yaw-free ENU level frame.  With row vectors this is p @ R.T.
+    r_level_from_body = _rot_zyx(float(roll_rad), float(pitch_rad), 0.0)
+    pts_level = pts_body @ r_level_from_body.T
+    pts_level[:, 2] *= -1.0  # ENU up -> HALSS positive-down
+
+    stats["z_min_body"] = float(np.min(pts_level[:, 2]))
+    stats["z_max_body"] = float(np.max(pts_level[:, 2]))
+    keep = (
+        (pts_level[:, 0] >= -half_x)
+        & (pts_level[:, 0] <= half_x)
+        & (pts_level[:, 1] >= -half_y)
+        & (pts_level[:, 1] <= half_y)
+        & (pts_level[:, 2] >= min_down)
+        & (pts_level[:, 2] <= max_down)
+    )
+    roi = pts_level[keep].astype(np.float32, copy=False)
+    stats["output_points"] = int(len(roi))
+    return roi, stats
 
 
 def world_to_body_down_roi(

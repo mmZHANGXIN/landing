@@ -125,18 +125,18 @@ def validate_export(sess, input_name, output_name, onnx_path, obs_shape):
         return None
 
     # 生成测试输入
-    # PPO2 观测: Box(0, 255), scale=True → VecNormalize 会做 /255
-    # 所以模型实际接收的是 [0, 1] 范围的 float32
+    # PPO2 graph includes policy scale=True as input/truediv (/255).
+    # Feed the raw Box(0,255) observation to both graphs; feeding obs/255 here
+    # would validate the same double-normalization bug on both sides.
     obs_raw = np.random.randint(0, 256, (4, *obs_shape), dtype=np.uint8).astype(np.float32)
-    obs_norm = obs_raw / 255.0
 
     # TF 推理
-    tf_out = sess.run(output_name, feed_dict={f"{input_name}:0": obs_norm})
+    tf_out = sess.run(output_name, feed_dict={f"{input_name}:0": obs_raw})
 
     # ONNX 推理
     ort_session = ort.InferenceSession(onnx_path)
     ort_inputs = ort_session.get_inputs()
-    ort_out = ort_session.run(None, {ort_inputs[0].name: obs_norm})
+    ort_out = ort_session.run(None, {ort_inputs[0].name: obs_raw})
 
     # 比较
     action_tf = np.argmax(tf_out, axis=1)
@@ -297,10 +297,10 @@ def main():
         "observation_space_high": float(obs_space.high.max()) if hasattr(obs_space, 'high') else 255,
         "action_space_n": int(model.action_space.n),
         "opset_version": args.opset,
-        "normalization": "obs/255  (VecNormalize scale=True on Box(0,255))",
+        "normalization": "ONNX graph input/truediv performs obs/255; caller feeds raw Box(0,255)",
         "export_notes": [
             "PPO2 CNN policy inference subgraph only",
-            "Input: (N, H, W, C) float32, range [0, 1]",
+            "External input: (N, H, W, C) float32, raw range [0, 255]",
             "Output: (N, 10) float32 action logits",
             "Use argmax(logits) to get discrete action 0-9",
         ],
