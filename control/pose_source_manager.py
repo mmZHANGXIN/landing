@@ -111,6 +111,7 @@ class PoseSourceManager:
 
         # --- 定位源配置 ---
         loc_cfg = cfg.get("localization", {})
+        self.require_fastlio_pose = bool(loc_cfg.get("fastlio_pose_required", True))
         self.control_pose_primary = str(loc_cfg.get("control_pose_primary", "fastlio_gravity_aligned"))
         self.control_pose_fallback = str(loc_cfg.get("control_pose_fallback", "mavros_gps_ekf"))
         self.allow_gps_fallback = bool(loc_cfg.get("allow_gps_fallback", True))
@@ -181,7 +182,11 @@ class PoseSourceManager:
         yaw_jump_deg = None
         pose_healthy = True
 
-        if fastlio_pose is None:
+        if not self.require_fastlio_pose:
+            # Perception-frontend mode deliberately has no FAST-LIO odometry.
+            # PX4 supplies the timestamp-matched control pose and attitude.
+            pose_healthy = True
+        elif fastlio_pose is None:
             pose_healthy = False
         elif fastlio_pose_stamp is not None:
             pose_age_ms = (now - fastlio_pose_stamp) * 1000.0
@@ -189,7 +194,12 @@ class PoseSourceManager:
                 pose_healthy = False
 
         # 跳变检测
-        if pose_healthy and fastlio_pose is not None and len(fastlio_pose) >= 6:
+        if (
+            self.require_fastlio_pose
+            and pose_healthy
+            and fastlio_pose is not None
+            and len(fastlio_pose) >= 6
+        ):
             pose_xyz = np.asarray(fastlio_pose[:3], dtype=np.float32)
             yaw = float(fastlio_pose[5])
 

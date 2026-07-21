@@ -5,12 +5,13 @@ Orin Landing - 真机实时感知-决策-控制主管线
 
 链路:
   GIS 九宫格全局安全区 → MAVROS/PX4 位置引导
-  Mid360 → FAST-LIO 去畸变点云/位姿
+  Mid360 → FAST-LIO frontend IMU 去畸变点云（室外不运行 SLAM 后端）
+  去畸变点云 → Mid360 安装外参补偿 → PX4 重力对齐 → 固定针孔射线采样
   点云 → HALSS Bayesian 二值安全语义图
   点云 → 原训练下视相机几何稀疏深度 → NN-fill 渲染深度
   [rendered_depth, binary_semantic] → ONNX PPO → 离散动作
   离散动作 + 同帧 Fast-LIO yaw → NED 速度 + yaw setpoint → PX4
-  python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros
+  python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros --allow-high-yaw-rate-test
 """
 
 from __future__ import annotations
@@ -528,6 +529,9 @@ class OrinLandingPipeline:
             localization_cfg.get("external_pose_topic", "/mavros/vision_pose/pose")
         )
         self.fastlio_odom_topic = localization_cfg.get("fastlio_odom_topic", "/Odometry")
+        self.fastlio_pose_required = bool(
+            localization_cfg.get("fastlio_pose_required", True)
+        )
         self._use_body_cloud = bool(
             localization_cfg.get(
                 "use_body_cloud",
@@ -596,8 +600,12 @@ class OrinLandingPipeline:
             self._setpoint_rate_hz,
         )
 
-        logger.info("[Init] Fast-LIO interface (cloud=%s body_mode=%s)...",
-                    self.fastlio_cloud_topic, self._use_body_cloud)
+        logger.info(
+            "[Init] Fast-LIO interface (cloud=%s body_mode=%s pose_required=%s)...",
+            self.fastlio_cloud_topic,
+            self._use_body_cloud,
+            self.fastlio_pose_required,
+        )
         self.fastlio = FastLIOInterface(use_ros=True)
 
         logger.info("[Init] Pose source manager...")
@@ -846,16 +854,21 @@ class OrinLandingPipeline:
                 rospy.init_node(node_name, anonymous=False)
             self._rospy = rospy
             self._ros_node = node_name
-            self._odom_sub = rospy.Subscriber(
-                self.fastlio_odom_topic, Odometry, self.fastlio.odometry_callback, queue_size=10
-            )
+            self._odom_sub = None
+            if self.fastlio_pose_required:
+                self._odom_sub = rospy.Subscriber(
+                    self.fastlio_odom_topic,
+                    Odometry,
+                    self.fastlio.odometry_callback,
+                    queue_size=10,
+                )
             self._cloud_sub = rospy.Subscriber(
                 self.fastlio_cloud_topic, PointCloud2, self.fastlio.pointcloud_callback, queue_size=10
             )
             logger.info(
-                "[ROS1] Node created, subscribed to %s + %s.",
-                self.fastlio_odom_topic,
+                "[ROS1] Node created, subscribed to cloud=%s odometry=%s.",
                 self.fastlio_cloud_topic,
+                self.fastlio_odom_topic if self.fastlio_pose_required else "disabled",
             )
             return True
         except Exception as e:
@@ -1198,6 +1211,21 @@ class OrinLandingPipeline:
             while self.mission_state not in ("LANDED", "ABORT", "EMERGENCY_STOP"):
                 loop_start = time.perf_counter()
 
+                # ── DEBUG: loop entry every 20 iterations ──
+                if self.step_count % 20 == 0:
+                    pts_now = self.fastlio.points
+                    stamp_now = self.fastlio.points_stamp
+                    logger.info(
+                        "[DEBUG_LOOP] state=%s cloud_seq=%d pose_seq=%d "
+                        "last_processed=%d points=%d stamp=%s",
+                        self.mission_state,
+                        self.fastlio.points_seq,
+                        self.fastlio.pose_seq,
+                        last_processed_seq,
+                        len(pts_now) if pts_now is not None else 0,
+                        f"{stamp_now:.3f}" if stamp_now is not None else "None",
+                    )
+
                 # Flight-controller state is authoritative and must be checked
                 # before waiting on perception.  Leaving OFFBOARD is an
                 # intentional manual takeover, not an autonomous emergency.
@@ -1220,15 +1248,26 @@ class OrinLandingPipeline:
                     sync_ms,
                 ) = self._grab_latest_snapshot()
                 cloud_stamp_ros_s = self.fastlio.points_stamp
+
+                # ── DEBUG: snapshot sync status ──
+                logger.debug(
+                    "[DEBUG_SNAPSHOT] pts=%s pose=%s cloud_seq=%d pose_seq=%d "
+                    "sync_ms=%s stamp=%s",
+                    "None" if frame_points is None else str(len(frame_points)),
+                    "None" if frame_pose is None else f"[{frame_pose[0]:.2f},{frame_pose[1]:.2f},{frame_pose[2]:.2f}]",
+                    cloud_seq, pose_seq,
+                    f"{sync_ms:.1f}" if sync_ms is not None else "None",
+                    f"{cloud_stamp_ros_s:.3f}" if cloud_stamp_ros_s is not None else "None",
+                )
                 if frame_points is None or frame_pose is None:
                     now = time.perf_counter()
                     if perception_gate_failure_since is None:
                         perception_gate_failure_since = now
                     if now - last_wait_log > 3.0:
                         logger.info(
-                            "[Pipeline] Waiting for %s + %s...",
+                            "[Pipeline] Waiting for cloud=%s + pose=%s...",
                             self.fastlio_cloud_topic,
-                            self.fastlio_odom_topic,
+                            "PX4 timestamp match" if self._use_body_cloud else self.fastlio_odom_topic,
                         )
                         last_wait_log = now
                     if self._use_body_cloud and frame_points is not None:
@@ -1326,8 +1365,14 @@ class OrinLandingPipeline:
                 now_ts = self._rospy.Time.now().to_sec() if self._rospy is not None else time.time()
                 health = self.pose_source_mgr.evaluate(
                     # In outdoor body-cloud mode /ali_odom is diagnostic only.
-                    fastlio_pose=self.fastlio.pose if self._use_body_cloud else frame_pose,
-                    fastlio_pose_stamp=self.fastlio.pose_stamp,
+                    fastlio_pose=(
+                        self.fastlio.pose
+                        if self.fastlio_pose_required
+                        else None
+                    ) if self._use_body_cloud else frame_pose,
+                    fastlio_pose_stamp=(
+                        self.fastlio.pose_stamp if self.fastlio_pose_required else None
+                    ),
                     fastlio_points=frame_points,
                     fastlio_points_stamp=self.fastlio.points_stamp,
                     now=now_ts,
@@ -1459,6 +1504,21 @@ class OrinLandingPipeline:
                 )
                 state_decision = self.state_manager.update(state_inputs)
                 self._apply_state_decision(state_decision)
+
+                # ── DEBUG: state manager gate ──
+                logger.info(
+                    "[DEBUG_GATE] cloud_seq=%d sync_ms=%s roi_points=%d "
+                    "state=%s allow_drl=%s direct_land=%s abort=%s "
+                    "reason=%s",
+                    cloud_seq,
+                    f"{sync_ms:.1f}" if sync_ms is not None else "None",
+                    halss_stats.get("output_points", 0),
+                    state_decision.state.value,
+                    state_decision.allow_drl,
+                    state_decision.direct_land,
+                    state_decision.abort,
+                    state_decision.reason,
+                )
 
                 if first_frame:
                     if self._use_body_cloud and self._halss_pinhole_ray_sampling:
@@ -1660,9 +1720,28 @@ class OrinLandingPipeline:
                     t_c1 = time.perf_counter()
 
                     t_r0 = time.perf_counter()
+                    # ── DEBUG: DRL input ──
+                    logger.debug(
+                        "[DEBUG_DRL_INPUT] depth_valid=%d/%d semantic_valid=%d/%d "
+                        "depth_range=[%.2f,%.2f] sem_unique=%s",
+                        int(np.sum(valid_mask)), valid_mask.size,
+                        int(np.sum(sem_map != self.danger_id)), sem_map.size,
+                        float(np.min(rendered_depth)), float(np.max(rendered_depth)),
+                        sorted(np.unique(sem_map).tolist()),
+                    )
                     action_id, rl_info = self.drl.predict(rendered_depth, sem_map)
                     rl_info["semantic_valid_ratio"] = float(np.mean(semantic_valid_mask))
                     t_r1 = time.perf_counter()
+                    # ── DEBUG: DRL output ──
+                    logger.info(
+                        "[DEBUG_DRL_OUTPUT] action_id=%d action_name=%s "
+                        "confidence=%.3f probs=%s",
+                        action_id,
+                        self.decomposer.action_id_to_name(action_id),
+                        float(rl_info.get("confidence", -1)),
+                        _top_probs(rl_info.get("action_probs")),
+                    )
+                    print(f"  ONNX {int((t_r1 - t_r0) * 1000)}ms act={action_id}", flush=True)
 
                     action_name = self.decomposer.action_id_to_name(action_id)
                     execution_yaw_ned = (
@@ -2462,9 +2541,9 @@ class OrinLandingPipeline:
 
         Outdoor body-cloud mode first performs the existing rigid transform and
         level-body ROI, then optionally keeps the nearest observed point in each
-        fixed pinhole ray.  The full ROI remains available to the 128x128 depth
-        z-buffer so HALSS acceleration does not unnecessarily reduce depth
-        coverage.  Indoor world-cloud behavior is unchanged.
+        fixed pinhole ray.  When pinhole-ray sampling is enabled, both HALSS
+        and Depth receive the same ray-sampled point set (shared sampling).
+        Indoor world-cloud behavior is unchanged.
         """
         if not self._use_body_cloud:
             points, stats = world_to_level_body_roi(
@@ -2481,7 +2560,9 @@ class OrinLandingPipeline:
         if not self._halss_pinhole_ray_sampling:
             return projection_points, projection_points, stats
 
-        halss_points, ray_stats = sample_nearest_points_by_camera_rays(
+        # Shared nearest-point-per-ray sampling: one call, both HALSS
+        # and depth projection consume the identical sparse point set.
+        sampled_points, ray_stats = sample_nearest_points_by_camera_rays(
             projection_points,
             self._training_camera,
             ray_width=self._halss_ray_grid_res,
@@ -2490,8 +2571,8 @@ class OrinLandingPipeline:
         stats["pre_ray_points"] = int(len(projection_points))
         stats["frustum_points"] = int(ray_stats["frustum_points"])
         stats["ray_grid"] = [self._halss_ray_grid_res, self._halss_ray_grid_res]
-        stats["output_points"] = int(len(halss_points))
-        return halss_points, projection_points, stats
+        stats["output_points"] = int(len(sampled_points))
+        return sampled_points, sampled_points, stats
 
     def _roi_bounds(self) -> dict:
         """Return the current (possibly dynamic) ROI bounds for HALSS / depth."""

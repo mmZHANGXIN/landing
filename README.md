@@ -222,6 +222,7 @@ roslaunch livox_ros_driver2 msg_MID360.launch rviz_enable:=false
 # 终端 3: FAST-LIO
 source ~/fast_lio_ws/devel/setup.bash
 roslaunch fast_lio mapping_mid360.launch rviz:=false
+roslaunch fast_lio frontend_mid360.launch
 
 ## 室内：FAST-LIO → /mavros/vision_pose/pose → PX4 EKF2
 roslaunch fast_lio mapping_mid360.launch external_vision:=true rviz:=false

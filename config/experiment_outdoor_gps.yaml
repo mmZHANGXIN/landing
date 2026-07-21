@@ -2,11 +2,20 @@
 # 完整运行快照会在启动时展开并保存，不依赖此 extends 文件离线复现。
 extends: "experiment_config.yaml"
 
+# 室外偏航故障验证严格分级: 0 → 0.3 → 0.5 → 1.0 rad/s
+# 通过专项高动态验证前禁止 >1.0。每级实验通过 CLI 显式覆盖:
+#   --yaw-rate-rad-s 0.3 --allow-high-yaw-rate-test
+uav:
+  yaw_rate_rad_s: 0.0              # 起步验证: 零偏航，确保平移控制链路正常
+
 localization:
   mode: "gps_px4_fastlio_perception"
   px4_position_source: "gps"
   allow_gps_fallback: false
   use_body_cloud: true
+  # FAST-LIO runs launch/frontend_mid360.launch: deskew frontend only.  PX4
+  # odometry is timestamp-matched to each cloud and supplies attitude/control.
+  fastlio_pose_required: false
   body_cloud_topic: "/cloud_registered_body"
 
 mission_state:

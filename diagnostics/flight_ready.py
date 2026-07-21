@@ -504,15 +504,28 @@ def _check_recording_contract(cfg: dict):
     if recording.get("enabled") is not True or recording.get("required") is not True:
         return False, "flight-ready gate: formal experiment rosbag must be enabled and required"
     topics = set(recording.get("bag_topics", []))
-    required = {
-        "/livox/lidar", "/livox/imu", "/ali_cloud", "/ali_odom",
-        "/mavros/vision_pose/pose", "/mavros/local_position/odom",
-        "/mavros/global_position/global", "/mavros/imu/data",
-        "/mavros/state", "/mavros/extended_state",
+    loc_mode = str(cfg.get("localization", {}).get("mode", "")).lower()
+
+    # Common PX4 telemetry required in every experiment profile.
+    common_px4 = {
+        "/livox/lidar", "/livox/imu",
+        "/mavros/local_position/odom", "/mavros/global_position/global",
+        "/mavros/imu/data", "/mavros/state", "/mavros/extended_state",
         "/mavros/setpoint_raw/local", "/mavros/setpoint_raw/target_local",
     }
-    if str(cfg.get("localization", {}).get("mode", "")).lower() == "gps_px4_fastlio_perception":
-        required.update({"/cloud_registered_body", "/fastlio/degeneracy_metrics"})
+
+    if loc_mode == "gps_px4_fastlio_perception":
+        # Outdoor frontend-only: body cloud + PX4 only.
+        # /ali_cloud, /ali_odom, /mavros/vision_pose/pose, /fastlio/degeneracy_metrics
+        # are SLAM-backend topics that do not exist in this mode.
+        required = common_px4 | {"/cloud_registered_body"}
+    else:
+        # Indoor full-SLAM: world cloud + aligned odometry + vision pose.
+        required = common_px4 | {
+            "/ali_cloud", "/ali_odom",
+            "/mavros/vision_pose/pose", "/fastlio/degeneracy_metrics",
+        }
+
     missing = sorted(required - topics)
     if missing:
         return False, "flight-ready gate: rosbag missing replay topics: " + ",".join(missing)

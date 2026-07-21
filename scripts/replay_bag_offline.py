@@ -681,6 +681,8 @@ def main():
                         halss_stats["frustum_points"] = int(ray_stats["frustum_points"])
                         halss_stats["ray_grid"] = [halss_ray_grid, halss_ray_grid]
                         halss_stats["output_points"] = int(len(halss_pts))
+                        # Shared sampling: depth projection also uses the same ray-sampled points.
+                        projection_pts = halss_pts
                     else:
                         halss_pts = projection_pts
                         halss_stats["output_points"] = int(len(halss_pts))

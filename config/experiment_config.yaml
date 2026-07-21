@@ -23,9 +23,6 @@ experiment_recording:
     - "/livox/lidar"
     - "/livox/imu"
     - "/cloud_registered_body"
-    - "/ali_cloud"
-    - "/ali_odom"
-    - "/fastlio/degeneracy_metrics"
     - "/mavros/vision_pose/pose"
     - "/mavros/local_position/odom"
     - "/mavros/global_position/global"
@@ -91,6 +88,7 @@ localization:
   fastlio_odom_topic: "/ali_odom"
   world_cloud_topic: "/ali_cloud"
   body_cloud_topic: "/cloud_registered_body"
+  fastlio_pose_required: true       # outdoor frontend-only profile overrides false
   max_gps_age_s: 2.0
   max_gps_horizontal_accuracy_m: 5.0
   external_pose_topic: "/mavros/vision_pose/pose" # 室内发布、室外禁止发布，由 FAST-LIO launch 参数控制
@@ -145,8 +143,9 @@ perception:
   halss_yaw_only: true             # HALSS 用世界重力+yaw 对齐, 不把安装俯仰当坡度
   halss_lidar_position_body_m: [0.13, 0.0, 0.08]  # Mid360 相对机体中心 [前,右,下] 米: 图中 13cm / 0cm / 8cm
   halss_lidar_yaw_offset_deg: 0.0  # Mid360 水平安装偏航误差; 图中未标侧向/偏航, 暂按 0
-  # 116°安装旋转只在 FAST-LIO config/mid360.yaml 中维护。
-  # /ali_cloud 已完成外参和重力对齐，主管线禁止再次应用安装旋转。
+  # Outdoor frontend publishes the deskewed scan at the Mid360 IMU origin.
+  # The 116° mount compensation is applied exactly once here, then PX4
+  # timestamp-matched roll/pitch levels the aircraft-frame cloud.
 
 # ---- 当前真机深度路径: 原训练相机几何 + OpenCV NN-fill ----
 depth_projection:
