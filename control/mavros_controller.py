@@ -342,6 +342,7 @@ class MAVROSController:
             stamp = float(msg.header.stamp.to_sec()) if hasattr(msg.header.stamp, "to_sec") else (
                 float(msg.header.stamp.secs) + float(msg.header.stamp.nsecs) * 1e-9
             )
+            received_perf = time.perf_counter()
             self._local_odom_stamp = stamp
             self._odom_history.append({
                 "stamp": stamp,
@@ -351,6 +352,7 @@ class MAVROSController:
                 "pitch": self.uavPitchENU,
                 "yaw_enu": self.uavYawENU,
                 "yaw_rate_enu": self.uavYawRateENU,
+                "received_perf": received_perf,
             })
 
             self._enu_ready = True

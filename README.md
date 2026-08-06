@@ -1,34 +1,7 @@
-# Orin Landing - 无人机偏航故障着陆系统
+# Orin Landing
 
 > 基于 Jetson Orin NX 16GB + Mid360 LiDAR + FAST-LIO + HALSS + ONNX DRL (ROS1 Noetic 版)
 
-## 架构概览
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    离线预处理（飞行前一次性）                          │
-│  GIS卫星图 → SegFormer分割 → 全局安全先验栅格图                      │
-└─────────────────────────────────────────────────────────────────────┘
-                                    ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                    在线管线（飞行中实时循环，验收以实测 P95 为准）       │
-│                                                                     │
-│  Mid360 LiDAR ─→ FAST-LIO ──→ 去畸变点云 ─→ HALSS Bayesian ─→ 语义图   │
-│                     ↑ IMU         │               安全评估            │
-│                                    ├──────────→ 深度投影 ──→ 深度图    │
-│                                                                     │
-│  语义图(128²) + 深度图(128²) ──→ ONNX DRL ──→ 离散动作(0~9)           │
-│                                                        ↓             │
-│                                                NED速度 → MAVSDK → PX4 │
-└─────────────────────────────────────────────────────────────────────┘
-
-实时可视化 (4窗口):
-  ┌──────────────┬──────────────┐
-  │  语义图       │  深度图       │
-  │  (安全=绿)    │  (热力图)     │
-  ├──────────────┼──────────────┤
-
-```
 
 ## 依赖环境
 
@@ -126,8 +99,8 @@ ls weights/ppo2_policy.onnx  # 确认存在
 
 编辑 `config/experiment_config.yaml`，关键参数:
 - `perception.halss_weight_path` — HALSS Bayesian UNet 权重路径
-- `uav.yaw_rate_rad_s` — 偏航转速 (rad/s)，在总配置
-  `config/experiment_config.yaml` 中修改；室内/室外 profile 均继承该值
+- `uav.yaw_rate_rad_s` — 偏航转速 (rad/s)，可在总配置、场景 profile
+  或命令行中设置；软件不限制其数值范围
 - `uav.action_lateral_sign` — -1 对齐原 DeepRL，+1 镜像模式
 
 ### Step 7: 运行
@@ -157,7 +130,8 @@ QGroundControl 参数由操作员配置，程序不会写入飞控。改完 EKF2
 
 正式飞行默认启动 rosbag。录包失败会在等待解锁前终止；台架调试可显式使用
 `--no-record-bag`。解锁、记录 home、垂直起飞和高空稳定阶段使用固定 yaw；
-进入 `GOTO_SAFE` 后才开始发送配置的 yaw-rate，并贯穿 warmup 与 DRL 降落。
+到达 Phase 1 集结点后，程序先原地保持位置并发送配置的 yaw-rate 旋转2秒，
+随后进入 `GOTO_SAFE`，该 yaw-rate 继续贯穿 GOTO、warmup 与 DRL 降落。
 MAVROS 后台线程始终以 `flight_controller.setpoint_rate_hz` 重发当前完整
 position/velocity＋yaw 或 yaw-rate setpoint；推理只更新平移动作，不决定偏航心跳频率。
 
@@ -176,7 +150,7 @@ roll/pitch 构造重力水平机体系 ROI。PX4 EKF/GPS 是 FSM、位置、高�
 FAST-LIO 必须每次实验重新启动并在静止状态初始化。草坪等大平面会使水平平移和 yaw
 弱可观，单天线 GPS 也不能提供可靠 yaw。若后续增加 GPS-LIO，应通过带时间戳、协方差、
 杆臂与异常值门控的测量更新或因子图维护 `map_gps→odom_lio`，禁止直接覆盖 FAST-LIO pose。
-正式验证的 yaw-rate 顺序为 `0 → 0.3 → 0.5 → 1.0rad/s`；通过专项高动态验证前禁止5rad/s。
+软件不对 yaw-rate 设置数值门控；实际可执行范围仍受 PX4 参数、机体动力学和场地条件约束。
 FAST-LIO 同时发布 `/fastlio/degeneracy_metrics`，数组依次为时间戳、有效约束数、平均残差、
 pose 信息矩阵最小/最大特征值、条件数、LiDAR-IMU时间差和位置范数；这些量先用于录包标定
 草坪/结构化场景阈值，本版本不依据未经标定的固定阈值修改滤波器状态。
@@ -227,6 +201,10 @@ roslaunch fast_lio frontend_mid360.launch
 ## 室内：FAST-LIO → /mavros/vision_pose/pose → PX4 EKF2
 roslaunch fast_lio mapping_mid360.launch external_vision:=true rviz:=false
 python pipeline.py --config ./config/experiment_indoor_fastlio.yaml --mode ros
+
+# 完整 SLAM launch 同时发布 /ali_odom、/ali_cloud、/cloud_registered_body、
+# /fastlio/degeneracy_metrics 和 /mavros/vision_pose/pose。室内主管线使用
+# /cloud_registered_body 做与室外一致的感知预处理，使用 /ali_odom 做定位健康检查。
 
 ## 室外：GPS → PX4 EKF2；FAST-LIO 仅供感知
 roslaunch fast_lio mapping_mid360.launch external_vision:=false rviz:=false

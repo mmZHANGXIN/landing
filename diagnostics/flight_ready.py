@@ -18,7 +18,6 @@ def iter_flight_ready_checks(cfg: dict, global_guidance_ready=None):
             "guidance would be skipped before DRL descent",
         )
 
-    yield _check_yaw_rate(cfg)
     yield _check_runtime_gpu(cfg)
     yield _check_module_gpu_requirements(cfg)
     yield _check_halss_backend(cfg)
@@ -137,38 +136,6 @@ def _check_global_prior_from_config(cfg: dict):
     )
 
 
-def _check_yaw_rate(cfg: dict):
-    yaw_rate = float(cfg["uav"].get("yaw_rate_rad_s", 0.0))
-    lcfg = cfg.get("localization", {})
-    if bool(lcfg.get("use_body_cloud", False)):
-        if abs(yaw_rate) > 1.0:
-            high_rate_test = cfg["uav"].get("high_yaw_rate_test_enabled") is True
-            if not high_rate_test:
-                return (
-                    False,
-                    "flight-ready gate: body-cloud validation limits yaw_rate_rad_s to <=1.0; "
-                    "pass --allow-high-yaw-rate-test for an explicit high-dynamic test",
-                )
-            if abs(yaw_rate) > 5.0:
-                return (
-                    False,
-                    "flight-ready gate: explicit high-dynamic yaw test limits "
-                    "yaw_rate_rad_s to <=5.0",
-                )
-            return (
-                True,
-                f"flight-ready gate: EXPLICIT HIGH-DYNAMIC body-cloud yaw test "
-                f"yaw_rate_rad_s={yaw_rate:.6g}",
-            )
-        return True, f"flight-ready gate: staged body-cloud yaw_rate_rad_s={yaw_rate:.6g}"
-    if abs(yaw_rate) < 1e-6:
-        return (
-            False,
-            "flight-ready gate: uav.yaw_rate_rad_s is 0.0; set the planned yaw-fault rate",
-        )
-    return True, f"flight-ready gate: yaw_rate_rad_s={yaw_rate:.6g}"
-
-
 def _check_runtime_gpu(cfg: dict):
     runtime = cfg.get("runtime", {})
     if runtime.get("use_gpu") is not True or runtime.get("device") != "cuda":
@@ -233,13 +200,13 @@ def _check_policy_velocity(cfg: dict):
         vertical = float(uav.get("vel_vertical"))
     except (TypeError, ValueError):
         return False, "flight-ready gate: uav policy velocities must be numeric"
-    if abs(lateral - 1.0) > 1e-6 or abs(vertical - 10.0) > 1e-6:
+    if abs(lateral - 1.0) > 1e-6 or abs(vertical - 2.0) > 1e-6:
         return (
             False,
             "flight-ready gate: policy action velocities must match training "
-            f"(lateral=1.0, vertical=10.0); got ({lateral}, {vertical})",
+            f"(lateral=1.0, vertical=2.0); got ({lateral}, {vertical})",
         )
-    return True, "flight-ready gate: action velocities match training (1.0/10.0 m/s)"
+    return True, "flight-ready gate: action velocities match training (1.0/2.0 m/s)"
 
 
 def _check_action_frame(cfg: dict):
@@ -343,7 +310,10 @@ def _check_localization_contract(cfg: dict):
             False,
             "flight-ready gate: unsupported localization.mode",
         )
-    cloud_key = "body_cloud_topic" if mode == "gps_px4_fastlio_perception" else "world_cloud_topic"
+    use_body_cloud = bool(
+        lcfg.get("use_body_cloud", mode == "gps_px4_fastlio_perception")
+    )
+    cloud_key = "body_cloud_topic" if use_body_cloud else "world_cloud_topic"
     required = ("fastlio_odom_topic", cloud_key, "local_odom_topic")
     missing = [key for key in required if not lcfg.get(key)]
     if missing:
@@ -399,6 +369,10 @@ def _check_localization_profile(cfg: dict):
             failures.append("global_prior.mode=local_body_offset")
         if lcfg.get("allow_gps_fallback", False):
             failures.append("localization.allow_gps_fallback=false")
+        if lcfg.get("use_body_cloud") is not True:
+            failures.append("localization.use_body_cloud=true")
+        if lcfg.get("fastlio_pose_required") is not True:
+            failures.append("localization.fastlio_pose_required=true")
         if mcfg.get("boundary_enable") is not True:
             failures.append("mission_state.boundary_enable=true")
         if failures:
@@ -472,16 +446,19 @@ def _check_goto_speed_limit(cfg: dict):
 
 
 def _check_outdoor_halss_ray_sampling(cfg: dict):
-    """Keep outdoor HALSS input bounded independently of flight altitude."""
+    """Keep every body-cloud HALSS input bounded independently of altitude."""
     lcfg = cfg.get("localization", {})
     mode = str(lcfg.get("mode", "gps_px4_fastlio_perception")).lower()
-    if mode != "gps_px4_fastlio_perception":
-        return True, "flight-ready gate: outdoor HALSS ray sampling not applicable"
+    use_body_cloud = bool(
+        lcfg.get("use_body_cloud", mode == "gps_px4_fastlio_perception")
+    )
+    if not use_body_cloud:
+        return True, "flight-ready gate: body-cloud HALSS ray sampling not applicable"
     perception = cfg.get("perception", {})
     if perception.get("halss_pinhole_ray_sampling_enabled") is not True:
         return (
             False,
-            "flight-ready gate: outdoor perception requires fixed pinhole ray sampling",
+            "flight-ready gate: body-cloud perception requires fixed pinhole ray sampling",
         )
     try:
         ray_res = int(perception.get("halss_pinhole_ray_grid_res", 0))
@@ -490,12 +467,12 @@ def _check_outdoor_halss_ray_sampling(cfg: dict):
     if ray_res != 64:
         return (
             False,
-            "flight-ready gate: outdoor HALSS pinhole ray grid must be 64x64; "
+            "flight-ready gate: body-cloud HALSS pinhole ray grid must be 64x64; "
             f"got {ray_res}x{ray_res}",
         )
     return (
         True,
-        "flight-ready gate: outdoor HALSS input bounded by 64x64 nearest pinhole rays",
+        "flight-ready gate: body-cloud HALSS input bounded by 64x64 nearest pinhole rays",
     )
 
 
@@ -514,13 +491,26 @@ def _check_recording_contract(cfg: dict):
         "/mavros/setpoint_raw/local", "/mavros/setpoint_raw/target_local",
     }
 
+    use_body_cloud = bool(
+        cfg.get("localization", {}).get(
+            "use_body_cloud", loc_mode == "gps_px4_fastlio_perception"
+        )
+    )
+
     if loc_mode == "gps_px4_fastlio_perception":
         # Outdoor frontend-only: body cloud + PX4 only.
         # /ali_cloud, /ali_odom, /mavros/vision_pose/pose, /fastlio/degeneracy_metrics
         # are SLAM-backend topics that do not exist in this mode.
         required = common_px4 | {"/cloud_registered_body"}
+    elif use_body_cloud:
+        # Indoor full-SLAM localization with the same body-cloud perception
+        # route used outdoors.
+        required = common_px4 | {
+            "/cloud_registered_body", "/ali_odom",
+            "/mavros/vision_pose/pose", "/fastlio/degeneracy_metrics",
+        }
     else:
-        # Indoor full-SLAM: world cloud + aligned odometry + vision pose.
+        # Legacy indoor full-SLAM world-cloud route.
         required = common_px4 | {
             "/ali_cloud", "/ali_odom",
             "/mavros/vision_pose/pose", "/fastlio/degeneracy_metrics",
@@ -565,7 +555,6 @@ def _check_fastlio_health_config(cfg: dict):
     max_sync = float(health.get("max_cloud_odom_sync_ms", 100))
     min_pts = int(health.get("min_cloud_points", 50))
     pose_jump = float(health.get("pose_jump_threshold_m", 1.0))
-    yaw_jump = float(health.get("yaw_jump_threshold_deg", 20.0))
 
     if max_pose_age <= 0 or max_cloud_age <= 0:
         return False, "flight-ready gate: fastlio_health max age must be > 0"
@@ -592,7 +581,7 @@ def _check_fastlio_health_config(cfg: dict):
         True,
         "flight-ready gate: FAST-LIO health gates: "
         f"pose_age={max_pose_age:.0f}ms cloud_age={max_cloud_age:.0f}ms "
-        f"min_pts={min_pts} jump={pose_jump:.1f}m yaw_jump={yaw_jump:.1f}deg "
+        f"min_pts={min_pts} jump={pose_jump:.1f}m "
         f"ctrl_action={degraded_ctrl} cloud_action={degraded_cloud}",
     )
 

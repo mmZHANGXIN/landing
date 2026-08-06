@@ -11,7 +11,7 @@ Orin Landing - 真机实时感知-决策-控制主管线
   点云 → 原训练下视相机几何稀疏深度 → NN-fill 渲染深度
   [rendered_depth, binary_semantic] → ONNX PPO → 离散动作
   离散动作 + 同帧 Fast-LIO yaw → NED 速度 + yaw setpoint → PX4
-  python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros --allow-high-yaw-rate-test
+  python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros
 """
 
 from __future__ import annotations
@@ -151,6 +151,31 @@ CLASS_TO_GRAY = {
     8: 50,
     9: 250,
 }
+
+FRAME_TIMING_BASE_FIELDS = [
+    "timestamp_ros_s", "cloud_stamp_ros_s", "cloud_seq", "pose_seq", "state",
+    "sync_ms", "pointcloud_preprocess_ms", "halss_ms", "depth_projection_ms",
+    "depth_completion_ms", "onnx_ms", "perception_inference_ms", "control_ms",
+    "pipeline_total_ms", "source_age_ms", "result_age_ms", "newer_frames",
+    "accepted", "fallback_reason",
+]
+
+# Appended only when runtime.enable_detailed_profiling=true.  Existing columns
+# remain first and unchanged so current analysis scripts keep working.
+FRAME_TIMING_DETAILED_FIELDS = [
+    "frame_id", "timestamp",
+    "cloud_receive_time_ms", "cloud_age_ms",
+    "pose_receive_time_ms", "pose_age_ms", "cloud_pose_sync_ms",
+    "cloud_points", "valid_projection_points",
+    "halss_total_ms", "halss_projection_ms", "halss_network_ms",
+    "halss_mc_samples", "semantic_generation_ms", "observation_generation_ms",
+    "depth_valid_ratio", "semantic_valid_ratio", "depth_mean_m", "depth_max_m",
+    "uncertainty_mean", "uncertainty_max", "obs_nan_count", "obs_inf_count",
+    "onnx_inference_ms", "onnx_input_min", "onnx_input_max", "onnx_input_mean",
+    "action_mapping_ms", "px4_command_send_ms", "action_id", "action_name",
+    "perception_total_ms", "policy_total_ms", "control_total_ms", "frame_total_ms",
+    "stage_error", "error_message",
+]
 
 
 def project_bev_depth(pts_body, grid_res=64, out_size=128, max_range=30.0,
@@ -297,7 +322,17 @@ class ONNXDRL:
             inp = obs_raw.astype(np.float32)
         return self.session.run([self.output_name], {self.input_name: inp})[0]
 
-    def predict(self, depth_map, sem_map):
+    def predict(self, depth_map, sem_map, profile: dict = None):
+        observation_start = time.perf_counter() if profile is not None else None
+        if profile is not None:
+            # Count corruption before the safety sanitization below; otherwise
+            # these diagnostics would always be zero.
+            profile["obs_nan_count"] = int(
+                np.isnan(depth_map).sum() + np.isnan(sem_map).sum()
+            )
+            profile["obs_inf_count"] = int(
+                np.isinf(depth_map).sum() + np.isinf(sem_map).sum()
+            )
         depth_clipped = np.clip(
             np.nan_to_num(depth_map, nan=self.dmax, posinf=self.dmax, neginf=0.0),
             0.0,
@@ -313,7 +348,22 @@ class ONNXDRL:
             sem_ch[sem_int == class_id] = float(gray_val)
 
         obs = np.expand_dims(np.stack([depth_ch, sem_ch], axis=-1), axis=0)
-        logits = self._forward(obs)[0]
+        if profile is not None:
+            profile["observation_encoding_ms"] = (
+                time.perf_counter() - observation_start
+            ) * 1000.0
+            profile["onnx_input_min"] = float(np.min(obs))
+            profile["onnx_input_max"] = float(np.max(obs))
+            profile["onnx_input_mean"] = float(np.mean(obs))
+            profile["observation_ready_perf"] = time.perf_counter()
+            inference_start = time.perf_counter()
+        try:
+            logits = self._forward(obs)[0]
+        finally:
+            if profile is not None:
+                profile["onnx_inference_ms"] = (
+                    time.perf_counter() - inference_start
+                ) * 1000.0
         logits = np.asarray(logits, dtype=np.float32)
         exps = np.exp(logits - float(np.max(logits)))
         probs = exps / max(float(np.sum(exps)), 1e-12)
@@ -454,8 +504,6 @@ def _build_config_overrides(args) -> dict:
     overrides = {}
     if getattr(args, "yaw_rate_rad_s", None) is not None:
         overrides.setdefault("uav", {})["yaw_rate_rad_s"] = float(args.yaw_rate_rad_s)
-    if getattr(args, "allow_high_yaw_rate_test", False):
-        overrides.setdefault("uav", {})["high_yaw_rate_test_enabled"] = True
     if getattr(args, "dmax", None) is not None:
         overrides.setdefault("depth_projection", {})["max_range"] = float(args.dmax)
     if getattr(args, "onnx_model", None):
@@ -517,6 +565,19 @@ class OrinLandingPipeline:
         )
         self.drop_stale_frames = bool(runtime_cfg.get("drop_stale_frames", True))
         self.drop_slow_frames = bool(runtime_cfg.get("drop_slow_frames", True))
+        self.enable_detailed_profiling = bool(
+            runtime_cfg.get("enable_detailed_profiling", False)
+        )
+        self.cold_warmup_timeout_s = float(
+            runtime_cfg.get("cold_warmup_timeout_s", 15.0)
+        )
+        self.fresh_validation_timeout_s = float(
+            runtime_cfg.get("fresh_validation_timeout_s", 10.0)
+        )
+        if self.cold_warmup_timeout_s <= 0.0:
+            raise ValueError("runtime.cold_warmup_timeout_s must be > 0")
+        if self.fresh_validation_timeout_s <= 0.0:
+            raise ValueError("runtime.fresh_validation_timeout_s must be > 0")
         self.max_cloud_odom_sync_ms = float(runtime_cfg.get("max_cloud_odom_sync_ms", 100.0))
         localization_cfg = self.cfg.get("localization", {})
         self.localization_mode = str(
@@ -525,6 +586,12 @@ class OrinLandingPipeline:
         self.px4_position_source = str(
             localization_cfg.get("px4_position_source", "gps")
         ).lower()
+        # Point-cloud representation and localization authority are independent.
+        # Both profiles may consume /cloud_registered_body, while only the
+        # outdoor GPS profile uses timestamp-matched PX4 odometry for perception.
+        self._px4_pose_authoritative = (
+            self.localization_mode == "gps_px4_fastlio_perception"
+        )
         self.external_pose_topic = str(
             localization_cfg.get("external_pose_topic", "/mavros/vision_pose/pose")
         )
@@ -643,6 +710,21 @@ class OrinLandingPipeline:
         self._goto_max_vertical_speed_mps = float(
             self.cfg.get("global_prior", {}).get("goto_max_vertical_speed_mps", 1.0)
         )
+        self._safe_stabilization_duration_s = float(
+            self.cfg.get("global_prior", {}).get(
+                "safe_point_stabilization_duration_s", 2.0
+            )
+        )
+        self._safe_stabilization_timeout_s = float(
+            self.cfg.get("global_prior", {}).get(
+                "safe_point_stabilization_timeout_s", 15.0
+            )
+        )
+        self._safe_stabilization_max_tilt_rad = math.radians(float(
+            self.cfg.get("global_prior", {}).get(
+                "safe_point_stabilization_max_tilt_deg", 10.0
+            )
+        ))
         if (
             self._goto_max_horizontal_speed_mps is not None
             and self._goto_max_horizontal_speed_mps <= 0.0
@@ -652,6 +734,54 @@ class OrinLandingPipeline:
             raise ValueError("global_prior.goto_horizontal_kp_s must be > 0")
         if self._goto_max_vertical_speed_mps <= 0.0:
             raise ValueError("global_prior.goto_max_vertical_speed_mps must be > 0")
+        if self._safe_stabilization_duration_s <= 0.0:
+            raise ValueError(
+                "global_prior.safe_point_stabilization_duration_s must be > 0"
+            )
+        if self._safe_stabilization_timeout_s < self._safe_stabilization_duration_s:
+            raise ValueError(
+                "global_prior.safe_point_stabilization_timeout_s must be >= duration"
+            )
+        if self._safe_stabilization_max_tilt_rad <= 0.0:
+            raise ValueError(
+                "global_prior.safe_point_stabilization_max_tilt_deg must be > 0"
+            )
+        global_prior_cfg = self.cfg.get("global_prior", {})
+        self._takeoff_staging_mode = str(
+            global_prior_cfg.get("takeoff_staging_mode", "home")
+        ).lower()
+        if self._takeoff_staging_mode not in ("home", "fixed_gps"):
+            raise ValueError(
+                "global_prior.takeoff_staging_mode must be home or fixed_gps"
+            )
+        self._takeoff_staging_lat = global_prior_cfg.get("takeoff_staging_lat")
+        self._takeoff_staging_lon = global_prior_cfg.get("takeoff_staging_lon")
+        staging_altitude = global_prior_cfg.get("takeoff_staging_altitude_m")
+        self._takeoff_staging_altitude_m = (
+            None if staging_altitude is None else float(staging_altitude)
+        )
+        if (
+            self._takeoff_staging_altitude_m is not None
+            and self._takeoff_staging_altitude_m <= 0.0
+        ):
+            raise ValueError(
+                "global_prior.takeoff_staging_altitude_m must be > 0"
+            )
+        if self._takeoff_staging_mode == "fixed_gps":
+            if self._takeoff_staging_lat is None or self._takeoff_staging_lon is None:
+                raise ValueError(
+                    "fixed_gps staging requires global_prior.takeoff_staging_lat/lon"
+                )
+            self._takeoff_staging_lat = float(self._takeoff_staging_lat)
+            self._takeoff_staging_lon = float(self._takeoff_staging_lon)
+            if not (
+                -90.0 <= self._takeoff_staging_lat <= 90.0
+                and -180.0 <= self._takeoff_staging_lon <= 180.0
+            ):
+                raise ValueError(
+                    "global_prior takeoff staging latitude/longitude is out of range"
+                )
+        self._takeoff_staging_enu_target = None
         self._use_global_guidance = False
         self._indoor_local_mode = False
         self._local_body_offset_m = None
@@ -735,6 +865,7 @@ class OrinLandingPipeline:
         self._frame_timing_path = None
         self._frame_timing_file = None
         self._frame_timing_writer = None
+        self._profiling_frame_id = 0
         self._perception_gate_path = None
         self._perception_gate_file = None
         self._perception_gate_writer = None
@@ -1027,7 +1158,7 @@ class OrinLandingPipeline:
         record_cfg = self.cfg.get("experiment_recording", {})
         if self._record_bag and record_cfg.get("required", False) and not recording_ok:
             raise RuntimeError("Required rosbag recording failed before arming")
-        if self._use_body_cloud:
+        if bool(self.cfg.get("fastlio_health", {}).get("require_static_initialization", True)):
             try:
                 await self._verify_fastlio_static_initialization()
             except Exception:
@@ -1044,7 +1175,7 @@ class OrinLandingPipeline:
         if self._use_global_guidance and not self._indoor_local_mode:
             _, launch_lat_lon, _ = await self.fc.wait_for_home(timeout_s=10.0)
             self._home_lat, self._home_lon = launch_lat_lon
-        if self._use_body_cloud:
+        if self._px4_pose_authoritative:
             self._ground_z_world = float(self._home_enu[2])
             self.state_manager.ground_z_ref_m = self._ground_z_world
             self.state_manager.height_source = "px4_enu_z"
@@ -1066,8 +1197,8 @@ class OrinLandingPipeline:
         logger.info("[Pipeline] Hold stream started. Waiting for RC OFFBOARD+arm...")
         rc_ok = await self.fc.wait_for_manual_offboard_and_arm(
             timeout_s=120.0,
-            # Keep yaw fixed while recording home and during vertical takeoff.
-            # The planned yaw fault starts only when GOTO_SAFE begins.
+            # Keep yaw fixed while recording home and flying to the staging
+            # point. The configured yaw-rate starts during the 2 s staging hover.
             post_arm_yaw_rate_rad_s=None,
         )
         if not rc_ok:
@@ -1105,12 +1236,45 @@ class OrinLandingPipeline:
             self._apply_state_decision(self.state_manager.start_after_takeoff(True))
 
         elif self._use_global_guidance:
-            self._takeoff_altitude_m = float(self._safe_altitude_m)
+            self._takeoff_altitude_m = float(
+                self._takeoff_staging_altitude_m
+                if self._takeoff_staging_altitude_m is not None
+                else self._safe_altitude_m
+            )
+            if self._takeoff_staging_mode == "fixed_gps":
+                staging_ned = self._gps_to_ned_offset_3d(
+                    self._takeoff_staging_lat,
+                    self._takeoff_staging_lon,
+                    self._takeoff_altitude_m,
+                )
+                self._takeoff_staging_enu_target = np.array(
+                    [staging_ned[1], staging_ned[0], -staging_ned[2]],
+                    dtype=np.float32,
+                )
+            else:
+                self._takeoff_staging_enu_target = np.array(
+                    [
+                        self._home_enu[0],
+                        self._home_enu[1],
+                        self._home_enu[2] + self._takeoff_altitude_m,
+                    ],
+                    dtype=np.float32,
+                )
             logger.info(
-                "[Pipeline] Home telemetry: lat=%.7f lon=%.7f ned=%s takeoff_alt=%.1fm",
+                "[Pipeline] Home telemetry: lat=%.7f lon=%.7f ned=%s "
+                "takeoff_alt=%.1fm staging_mode=%s staging_enu=%s",
                 self._home_lat, self._home_lon, _fmt_vec(self._home_ned),
                 self._takeoff_altitude_m,
+                self._takeoff_staging_mode,
+                _fmt_vec(self._takeoff_staging_enu_target),
             )
+            if self._takeoff_staging_mode == "fixed_gps":
+                logger.info(
+                    "[Pipeline] Fixed GPS staging point: lat=%.7f lon=%.7f alt=%.1fm",
+                    self._takeoff_staging_lat,
+                    self._takeoff_staging_lon,
+                    self._takeoff_altitude_m,
+                )
 
             if self._safe_ned is None:
                 self._safe_ned = self._gps_to_ned_offset_3d(
@@ -1138,9 +1302,16 @@ class OrinLandingPipeline:
         if self._indoor_local_mode or self._use_global_guidance:
             print(f"\n>>> Phase 1: Taking off to {self._takeoff_altitude_m:.1f}m ...", flush=True)
             self._log_mission_event(
-                "TAKEOFF_STARTED", reason=f"target_altitude_m={self._takeoff_altitude_m:.3f}"
+                "TAKEOFF_STARTED",
+                reason=(
+                    f"staging_mode={self._takeoff_staging_mode};"
+                    f"target_altitude_m={self._takeoff_altitude_m:.3f}"
+                ),
             )
-            reached_high_altitude = await self._vertical_takeoff(self._takeoff_altitude_m)
+            reached_high_altitude = await self._vertical_takeoff(
+                self._takeoff_altitude_m,
+                target_enu=self._takeoff_staging_enu_target,
+            )
             if reached_high_altitude:
                 self._log_mission_event(
                     "HIGH_ALTITUDE_REACHED",
@@ -1176,8 +1347,8 @@ class OrinLandingPipeline:
 
         # --- GPU warmup: 在安全点运行一帧 HALSS + depth + DRL, 预热 CUDA ---
         print(f"\n>>> GPU warmup at safe point ...", flush=True)
-        warmup_ok = await self._warmup_perception()
-        if not warmup_ok:
+        validated_cloud_seq = await self._warmup_perception()
+        if validated_cloud_seq is None:
             self._apply_state_decision(self.state_manager.reset(
                 MissionState.HOLD_FOR_MANUAL,
                 "perception_warmup_failed",
@@ -1189,27 +1360,46 @@ class OrinLandingPipeline:
             await self._hold_for_manual_takeover()
             await self._shutdown()
             return
-        print(f">>> GPU warmup complete.", flush=True)
+        print(
+            f">>> GPU warmup complete. validated_cloud_seq={validated_cloud_seq}",
+            flush=True,
+        )
 
         print(f"\n>>> Starting DRL descent loop ...", flush=True)
-        await self._run_descent_loop()
+        await self._run_descent_loop(start_after_cloud_seq=validated_cloud_seq)
         await self._shutdown()
 
     # The former MAVSDK arm/offboard branch was intentionally removed from the
     # live entry point. Historical MAVSDK adapters remain in control/ only for
     # old offline tools; real flights use MAVROS and manual RC OFFBOARD + arm.
 
-    async def _run_descent_loop(self):
+    async def _run_descent_loop(self, start_after_cloud_seq: int = -1):
         logger.info("[Pipeline] Starting DRL descent control loop...")
-        print(f"[DescentLoop] Entered. mission_state={self.mission_state}", flush=True)
-        last_processed_seq = -1
+        print(
+            f"[DescentLoop] Entered. mission_state={self.mission_state} "
+            f"waiting_for_cloud_seq>{int(start_after_cloud_seq)}",
+            flush=True,
+        )
+        # The fresh frame validated by warmup has already completed the full
+        # HALSS/depth/ONNX chain. Wait for a strictly newer sensor frame instead
+        # of immediately running the same cloud through the chain a second time.
+        last_processed_seq = int(start_after_cloud_seq)
         last_wait_log = 0.0
         first_frame = True
         perception_gate_failure_since = None
+        active_profile = None
+        active_stage = "frame_start"
+        active_profile_logged = False
 
         try:
             while self.mission_state not in ("LANDED", "ABORT", "EMERGENCY_STOP"):
                 loop_start = time.perf_counter()
+                active_stage = "sensor_snapshot"
+                active_profile_logged = False
+                active_profile = (
+                    {"frame_start_perf": loop_start, "timestamp": self._ros_time_now_s()}
+                    if self.enable_detailed_profiling else None
+                )
 
                 # ── DEBUG: loop entry every 20 iterations ──
                 if self.step_count % 20 == 0:
@@ -1246,7 +1436,7 @@ class OrinLandingPipeline:
                     cloud_seq,
                     pose_seq,
                     sync_ms,
-                ) = self._grab_latest_snapshot()
+                ) = self._grab_latest_snapshot(active_profile)
                 cloud_stamp_ros_s = self.fastlio.points_stamp
 
                 # ── DEBUG: snapshot sync status ──
@@ -1267,7 +1457,11 @@ class OrinLandingPipeline:
                         logger.info(
                             "[Pipeline] Waiting for cloud=%s + pose=%s...",
                             self.fastlio_cloud_topic,
-                            "PX4 timestamp match" if self._use_body_cloud else self.fastlio_odom_topic,
+                            (
+                                "PX4 timestamp match"
+                                if self._px4_pose_authoritative
+                                else self.fastlio_odom_topic
+                            ),
                         )
                         last_wait_log = now
                     if self._use_body_cloud and frame_points is not None:
@@ -1300,6 +1494,15 @@ class OrinLandingPipeline:
                 if cloud_seq <= last_processed_seq:
                     await asyncio.sleep(0.005)
                     continue
+
+                if active_profile is not None:
+                    self._profiling_frame_id += 1
+                    active_profile.update({
+                        "frame_id": self._profiling_frame_id,
+                        "cloud_seq": cloud_seq,
+                        "pose_seq": pose_seq,
+                        "state": self.mission_state,
+                    })
 
                 if sync_ms is None:
                     logger.warning(
@@ -1364,12 +1567,11 @@ class OrinLandingPipeline:
                 # time.perf_counter(), which has an unrelated process-local epoch.
                 now_ts = self._rospy.Time.now().to_sec() if self._rospy is not None else time.time()
                 health = self.pose_source_mgr.evaluate(
-                    # In outdoor body-cloud mode /ali_odom is diagnostic only.
+                    # Outdoor frontend-only mode has no required FAST-LIO pose;
+                    # indoor body-cloud mode still uses /ali_odom as localization.
                     fastlio_pose=(
-                        self.fastlio.pose
-                        if self.fastlio_pose_required
-                        else None
-                    ) if self._use_body_cloud else frame_pose,
+                        self.fastlio.pose if self.fastlio_pose_required else None
+                    ),
                     fastlio_pose_stamp=(
                         self.fastlio.pose_stamp if self.fastlio_pose_required else None
                     ),
@@ -1379,7 +1581,7 @@ class OrinLandingPipeline:
                 )
 
                 # Outdoor body-cloud mode is PX4-authoritative by construction.
-                if self._use_body_cloud:
+                if self._px4_pose_authoritative:
                     control_pose = frame_pose
                 elif health.control_pose_source.value == "gps_fallback":
                     control_pose = np.array([
@@ -1456,11 +1658,17 @@ class OrinLandingPipeline:
 
                 # Outdoor uses the deskewed IMU/body cloud and PX4 roll/pitch;
                 # indoor retains the matched FAST-LIO world cloud/pose path.
+                active_stage = "halss_projection"
                 t_p0 = time.perf_counter()
                 halss_points, projection_points, halss_stats = self._prepare_halss_points(
                     frame_points, frame_pose, control_pose, dyn_half_x, dyn_half_y,
                 )
                 t_p1 = time.perf_counter()
+                if active_profile is not None:
+                    active_profile["halss_projection_ms"] = (t_p1 - t_p0) * 1000.0
+                    active_profile["valid_projection_points"] = int(
+                        halss_stats.get("frustum_points", halss_stats.get("output_points", 0))
+                    )
                 self._log_perception_gate(
                     cloud_seq, pose_seq, sync_ms, control_pose,
                     "ready_for_inference", halss_stats["output_points"] >= 10,
@@ -1489,7 +1697,7 @@ class OrinLandingPipeline:
                     yaw_rad=pose_yaw,
                     velocity_xyz=tuple(float(x) for x in getattr(
                         self.fc,
-                        "uavVelENU" if self._use_body_cloud else "uavVelNED",
+                        "uavVelENU" if self._px4_pose_authoritative else "uavVelNED",
                         np.zeros(3),
                     )[:3]),
                     cloud_odom_sync_ms=sync_ms,
@@ -1550,7 +1758,7 @@ class OrinLandingPipeline:
                     break
 
                 # --- FAST-LIO 健康退化动作 ---
-                if health.degraded_action is not None and not self._use_body_cloud:
+                if health.degraded_action is not None and not self._px4_pose_authoritative:
                     degraded = health.degraded_action.value
                     if degraded == "abort":
                         logger.error(
@@ -1655,11 +1863,20 @@ class OrinLandingPipeline:
                     action_yaw_rate = self.yaw_rate_cmd if state_decision.continue_yaw_rate else 0.0
                     t_r1 = time.perf_counter()
                 else:
+                    active_stage = "halss"
                     t_h0 = time.perf_counter()
                     roi_bounds = self._roi_bounds()
-                    halss_result = self.halss.evaluate(
-                        halss_points, fixed_bounds=roi_bounds,
-                    )
+                    try:
+                        halss_result = self.halss.evaluate(
+                            halss_points, fixed_bounds=roi_bounds,
+                            profile=active_profile,
+                        )
+                    finally:
+                        if active_profile is not None:
+                            active_profile.setdefault(
+                                "halss_total_ms",
+                                (time.perf_counter() - t_h0) * 1000.0,
+                            )
                     t_h1 = time.perf_counter()
                     if halss_stats["output_points"] < 10:
                         logger.warning(
@@ -1674,6 +1891,8 @@ class OrinLandingPipeline:
                             halss_stats["z_max_body"],
                         )
 
+                    active_stage = "semantic_generation"
+                    semantic_start = time.perf_counter()
                     if halss_result is not None:
                         bev_data = halss_result.get("bev_data", halss_result)
                         sem_map = self.sem_gen.generate(bev_data)
@@ -1684,7 +1903,12 @@ class OrinLandingPipeline:
                         safe_id=self.safe_id,
                         danger_id=self.danger_id,
                     )
+                    if active_profile is not None:
+                        active_profile["semantic_generation_ms"] = (
+                            time.perf_counter() - semantic_start
+                        ) * 1000.0
 
+                    active_stage = "depth_projection"
                     t_d0 = time.perf_counter()
                     semantic_valid_mask = np.ones_like(sem_map, dtype=bool)
                     if self._projection_mode == "training_camera":
@@ -1714,11 +1938,35 @@ class OrinLandingPipeline:
                         )
                         valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
                     t_d1 = time.perf_counter()
+                    if active_profile is not None:
+                        active_profile["depth_projection_ms"] = (t_d1 - t_d0) * 1000.0
 
+                    active_stage = "observation_generation"
                     t_c0 = time.perf_counter()
                     rendered_depth = render_sparse_depth(sparse_depth, valid_mask, self.depth_max)
                     t_c1 = time.perf_counter()
+                    if active_profile is not None:
+                        active_profile["depth_completion_ms"] = (t_c1 - t_c0) * 1000.0
+                        active_profile["depth_valid_ratio"] = float(np.mean(valid_mask))
+                        active_profile["semantic_valid_ratio"] = float(
+                            np.mean(semantic_valid_mask)
+                        )
+                        valid_depth = sparse_depth[valid_mask]
+                        active_profile["depth_mean_m"] = (
+                            float(np.mean(valid_depth)) if valid_depth.size else None
+                        )
+                        active_profile["depth_max_m"] = (
+                            float(np.max(valid_depth)) if valid_depth.size else None
+                        )
+                        variance = (
+                            halss_result.get("variance_map")
+                            if halss_result is not None else None
+                        )
+                        if variance is not None:
+                            active_profile["uncertainty_mean"] = float(np.mean(variance))
+                            active_profile["uncertainty_max"] = float(np.max(variance))
 
+                    active_stage = "onnx_inference"
                     t_r0 = time.perf_counter()
                     # ── DEBUG: DRL input ──
                     logger.debug(
@@ -1729,9 +1977,22 @@ class OrinLandingPipeline:
                         float(np.min(rendered_depth)), float(np.max(rendered_depth)),
                         sorted(np.unique(sem_map).tolist()),
                     )
-                    action_id, rl_info = self.drl.predict(rendered_depth, sem_map)
+                    action_id, rl_info = self.drl.predict(
+                        rendered_depth, sem_map, profile=active_profile,
+                    )
                     rl_info["semantic_valid_ratio"] = float(np.mean(semantic_valid_mask))
                     t_r1 = time.perf_counter()
+                    if active_profile is not None:
+                        active_profile["policy_total_ms"] = (t_r1 - t_r0) * 1000.0
+                        active_profile["observation_generation_ms"] = (
+                            active_profile.get("observation_ready_perf", t_r0)
+                            - semantic_start
+                        )
+                        active_profile["observation_generation_ms"] *= 1000.0
+                        observation_ready = active_profile.get("observation_ready_perf", t_r0)
+                        active_profile["perception_total_ms"] = (
+                            observation_ready - loop_start
+                        ) * 1000.0
                     # ── DEBUG: DRL output ──
                     logger.info(
                         "[DEBUG_DRL_OUTPUT] action_id=%d action_name=%s "
@@ -1743,6 +2004,8 @@ class OrinLandingPipeline:
                     )
                     print(f"  ONNX {int((t_r1 - t_r0) * 1000)}ms act={action_id}", flush=True)
 
+                    active_stage = "action_mapping"
+                    action_mapping_start = time.perf_counter()
                     action_name = self.decomposer.action_id_to_name(action_id)
                     execution_yaw_ned = (
                         float(self.fc.uavAngEular[2])
@@ -1753,6 +2016,12 @@ class OrinLandingPipeline:
                         action_id,
                         execution_yaw_ned,
                     )
+                    if active_profile is not None:
+                        active_profile["action_mapping_ms"] = (
+                            time.perf_counter() - action_mapping_start
+                        ) * 1000.0
+                        active_profile["action_id"] = int(action_id)
+                        active_profile["action_name"] = action_name
 
                 if (
                     state_decision.reason.endswith("crosscheck_warn")
@@ -1780,6 +2049,8 @@ class OrinLandingPipeline:
                 result_too_old = result_age_ms > self.max_inference_result_age_ms
                 if (result_too_old and self.drop_stale_frames and self.drop_slow_frames
                         and not state_decision.direct_land):
+                    active_stage = "stale_result_fallback"
+                    stale_control_start = time.perf_counter()
                     await self._send_zero_velocity_logged(
                         action_yaw_rate, time.perf_counter(),
                         state=state_decision.state.value,
@@ -1788,6 +2059,17 @@ class OrinLandingPipeline:
                         sync_ms=sync_ms,
                         fallback_reason="inference_result_too_old",
                     )
+                    stale_control_end = time.perf_counter()
+                    if active_profile is not None:
+                        active_profile["px4_command_send_ms"] = (
+                            stale_control_end - stale_control_start
+                        ) * 1000.0
+                        active_profile["control_total_ms"] = (
+                            stale_control_end - t_r1
+                        ) * 1000.0
+                        active_profile["frame_total_ms"] = (
+                            stale_control_end - loop_start
+                        ) * 1000.0
                     self._record_timing(
                         t_h1 - t_h0, t_d1 - t_d0, t_c1 - t_c0,
                         t_r1 - t_r0, 0.0, time.perf_counter() - loop_start,
@@ -1803,7 +2085,9 @@ class OrinLandingPipeline:
                         fallback_reason="inference_result_too_old",
                         perception_executed=True,
                         pointcloud_preprocess_s=t_p1 - t_p0,
+                        detailed_profile=active_profile,
                     )
+                    active_profile_logged = True
                     logger.warning(
                         "[%04d] INFERENCE RESULT TOO OLD age=%.0fms limit=%.0fms "
                         "cloud_seq=%d pose_seq=%d yaw=%.1fdeg yaw_rate_sp=%.2f act=%d(%s) v_ned=%s",
@@ -1830,6 +2114,7 @@ class OrinLandingPipeline:
                     await asyncio.sleep(max(0.0, self.sim_dt - (time.perf_counter() - loop_start)))
                     continue
 
+                active_stage = "px4_command_send"
                 t_ctrl = time.perf_counter()
                 # ENU velocity + yaw_rate control
                 enu_vx, enu_vy, enu_vz = ned_to_enu_velocity(
@@ -1852,6 +2137,10 @@ class OrinLandingPipeline:
                     )
                 v_mavros_sp = np.array([enu_vx, enu_vy, enu_vz], dtype=np.float32)
                 t_ctrl_end = time.perf_counter()
+                if active_profile is not None:
+                    active_profile["px4_command_send_ms"] = (t_ctrl_end - t_ctrl) * 1000.0
+                    active_profile["control_total_ms"] = (t_ctrl_end - t_r1) * 1000.0
+                    active_profile["frame_total_ms"] = (t_ctrl_end - loop_start) * 1000.0
 
                 # ---- real-time per-frame output (like test_live_nocontrol.py) ----
                 pos_str = f"pos=({control_pose[0]:.1f},{control_pose[1]:.1f},{control_pose[2]:.2f})"
@@ -1886,10 +2175,13 @@ class OrinLandingPipeline:
                     sync_ms=sync_ms,
                     direct_land=state_decision.direct_land,
                     fallback_reason="",
-                    health_ctrl="px4_ekf" if self._use_body_cloud else health.control_pose_source.value,
+                    health_ctrl=(
+                        "px4_ekf" if self._px4_pose_authoritative
+                        else health.control_pose_source.value
+                    ),
                     health_cloud_src=("fastlio_deskewed_body" if self._use_body_cloud
                                       else health.perception_cloud_source.value),
-                    health_pose_ok=("diagnostic" if self._use_body_cloud else
+                    health_pose_ok=("diagnostic" if self._px4_pose_authoritative else
                                     ("ok" if health.fastlio_pose_healthy else "degraded")),
                     health_cloud_ok="ok" if health.fastlio_cloud_healthy else "degraded",
                 )
@@ -1933,7 +2225,9 @@ class OrinLandingPipeline:
                     fallback_reason="",
                     perception_executed=not state_decision.direct_land,
                     pointcloud_preprocess_s=t_p1 - t_p0,
+                    detailed_profile=active_profile,
                 )
+                active_profile_logged = not state_decision.direct_land
 
                 try:
                     self.visualizer.update(
@@ -1966,6 +2260,11 @@ class OrinLandingPipeline:
             logger.info("[Pipeline] Interrupted by user.")
             self.mission_state = "ABORT"
         except Exception as e:
+            if active_profile is not None and not active_profile_logged:
+                try:
+                    self._log_profile_failure(active_profile, active_stage, e)
+                except Exception as log_error:
+                    logger.warning("[Profiling] Failed to log fatal frame: %s", log_error)
             logger.error("[Pipeline] Fatal error: %s", e)
             import traceback
             traceback.print_exc()
@@ -2013,7 +2312,7 @@ class OrinLandingPipeline:
         _fc_vel = getattr(self.fc, "uavVelNED", np.zeros(3, dtype=np.float32)) if self.fc else np.zeros(3)
         _att = getattr(self.fc, "uavAngEular", np.zeros(3, dtype=np.float32)) if self.fc else np.zeros(3)
         _yaw = float(pose_xyz[5]) if pose_xyz is not None and len(pose_xyz) > 5 else float(_att[2])
-        if self._use_body_cloud and self.fc is not None:
+        if self._px4_pose_authoritative and self.fc is not None:
             height_pose = tuple(float(v) for v in self.fc.uavPosENU)
         elif pose_xyz is not None:
             height_pose = tuple(float(v) for v in pose_xyz[:3])
@@ -2040,46 +2339,130 @@ class OrinLandingPipeline:
             sync_ms=sync_ms,
             direct_land=False,
             fallback_reason=fallback_reason,
-            health_ctrl="px4_ekf" if self._use_body_cloud else report.control_pose_source.value,
+            health_ctrl=(
+                "px4_ekf" if self._px4_pose_authoritative
+                else report.control_pose_source.value
+            ),
             health_cloud_src=("fastlio_deskewed_body" if self._use_body_cloud
                               else report.perception_cloud_source.value),
-            health_pose_ok="diagnostic" if self._use_body_cloud else (
+            health_pose_ok="diagnostic" if self._px4_pose_authoritative else (
                 "ok" if report.fastlio_pose_healthy else "degraded"
             ),
             health_cloud_ok="ok" if report.fastlio_cloud_healthy else "degraded",
         )
 
-    async def _warmup_perception(self) -> bool:
-        """Warm CUDA, then verify one fresh full inference meets the age budget.
+    async def _warmup_perception(self):
+        """Warm CUDA, then accept one newer full inference within the age budget.
 
-        The drone stays in position hold (last Phase 2 setpoint still active in background thread).
-        The cold pass is discarded.  A second, newer cloud must complete within
-        max_inference_result_age_ms or descent remains blocked.
+        Cold startup and fresh-frame validation have independent time budgets.
+        The cold result and every cloud received while it runs are discarded.
+        Validation always waits for the newest subsequent cloud, and one valid
+        inference is sufficient to unblock descent. Returns that validated
+        ``cloud_seq``; failures return ``None``.
         """
-        warmup_start = time.perf_counter()
-        timeout_s = 15.0
-        cold_pass_cloud_seq = None
+        phase = "cold"
+        phase_start = time.perf_counter()
+        fresh_after_cloud_seq = None
+        wait_counts = {"cold": {}, "fresh": {}}
+        last_wait_log = 0.0
+        last_wait_reason = None
 
-        while time.perf_counter() - warmup_start < timeout_s:
-            frame_pts, frame_pose, cloud_seq, pose_seq, sync_ms = self._grab_latest_snapshot()
+        def report_wait(reason: str, detail: str) -> None:
+            nonlocal last_wait_log, last_wait_reason
+            counts = wait_counts[phase]
+            counts[reason] = counts.get(reason, 0) + 1
+            now = time.perf_counter()
+            if reason != last_wait_reason or now - last_wait_log >= 1.0:
+                print(
+                    f"  Warmup {phase} waiting: reason={reason} {detail}",
+                    flush=True,
+                )
+                last_wait_log = now
+                last_wait_reason = reason
+
+        while True:
+            timeout_s = (
+                self.cold_warmup_timeout_s
+                if phase == "cold"
+                else self.fresh_validation_timeout_s
+            )
+            if time.perf_counter() - phase_start >= timeout_s:
+                summary = ", ".join(
+                    f"{reason}={count}"
+                    for reason, count in sorted(wait_counts[phase].items())
+                ) or "none"
+                phase_text = "cold phase" if phase == "cold" else "fresh validation"
+                print(
+                    f"  Warmup {phase_text} timeout after {timeout_s:.1f}s "
+                    f"(waits: {summary}) — requesting manual takeover",
+                    flush=True,
+                )
+                return None
+
+            warmup_profile = (
+                {
+                    "frame_start_perf": time.perf_counter(),
+                    "timestamp": self._ros_time_now_s(),
+                    "state": "WARMUP_COLD" if phase == "cold" else "WARMUP_FRESH",
+                }
+                if self.enable_detailed_profiling else None
+            )
+            warmup_stage = "sensor_snapshot"
+            frame_pts, frame_pose, cloud_seq, pose_seq, sync_ms = self._grab_latest_snapshot(
+                warmup_profile
+            )
+            cloud_stamp = self.fastlio.points_stamp
             if self.fc is not None and (
                 getattr(self.fc, "isOffboard", None) is False
                 or getattr(self.fc, "isArmed", None) is False
             ):
                 print("  Warmup cancelled: vehicle is not armed in OFFBOARD", flush=True)
-                return False
-            if frame_pts is None or frame_pose is None:
+                return None
+
+            if phase == "fresh":
+                if (
+                    fresh_after_cloud_seq is None
+                    or cloud_seq <= fresh_after_cloud_seq
+                ):
+                    report_wait(
+                        "no_fresh_cloud",
+                        f"cloud_seq={cloud_seq} need>{fresh_after_cloud_seq}",
+                    )
+                    await asyncio.sleep(0.01)
+                    continue
+                # Consume each new cloud once. A failed candidate must not be
+                # retried while newer sensor data is available.
+                fresh_after_cloud_seq = cloud_seq
+
+            if frame_pts is None:
+                report_wait("pointcloud_missing", f"cloud_seq={cloud_seq}")
                 await asyncio.sleep(0.1)
                 continue
-            if sync_ms is None or sync_ms > self.max_cloud_odom_sync_ms:
+            if frame_pose is None:
+                report_wait("matched_pose_missing", f"cloud_seq={cloud_seq}")
                 await asyncio.sleep(0.05)
                 continue
-            if cold_pass_cloud_seq is not None and cloud_seq <= cold_pass_cloud_seq:
-                await asyncio.sleep(0.01)
+            if sync_ms is None:
+                report_wait("sync_missing", f"cloud_seq={cloud_seq}")
+                await asyncio.sleep(0.05)
+                continue
+            if sync_ms > self.max_cloud_odom_sync_ms:
+                report_wait(
+                    "sync_too_large",
+                    f"sync_ms={sync_ms:.1f} limit={self.max_cloud_odom_sync_ms:.1f}",
+                )
+                await asyncio.sleep(0.05)
                 continue
 
             t0 = time.perf_counter()
             try:
+                if warmup_profile is not None:
+                    self._profiling_frame_id += 1
+                    warmup_profile.update({
+                        "frame_id": self._profiling_frame_id,
+                        "cloud_seq": cloud_seq,
+                        "pose_seq": pose_seq,
+                    })
                 # Dynamic FOV ROI
                 dyn_half_x, dyn_half_y, _ = self._compute_roi_half_from_height(
                     float(frame_pose[2]), None
@@ -2090,22 +2473,55 @@ class OrinLandingPipeline:
                 }
 
                 # HALSS
+                warmup_stage = "halss_projection"
+                stage_start = time.perf_counter()
                 halss_pts, projection_pts, halss_stats = self._prepare_halss_points(
                     frame_pts, frame_pose, frame_pose, dyn_half_x, dyn_half_y,
                 )
-                if int(halss_stats.get("output_points", 0)) < 10:
+                if warmup_profile is not None:
+                    warmup_profile["halss_projection_ms"] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000.0
+                    warmup_profile["valid_projection_points"] = int(
+                        halss_stats.get("frustum_points", halss_stats.get("output_points", 0))
+                    )
+                output_points = int(halss_stats.get("output_points", 0))
+                if output_points < 10:
+                    report_wait(
+                        "roi_sparse",
+                        f"points={output_points} minimum=10 cloud_seq={cloud_seq}",
+                    )
                     await asyncio.sleep(0.05)
                     continue
-                halss_result = self.halss.evaluate(halss_pts, fixed_bounds=roi_bounds)
+                warmup_stage = "halss"
+                stage_start = time.perf_counter()
+                try:
+                    halss_result = self.halss.evaluate(
+                        halss_pts, fixed_bounds=roi_bounds, profile=warmup_profile,
+                    )
+                finally:
+                    if warmup_profile is not None:
+                        warmup_profile.setdefault(
+                            "halss_total_ms",
+                            (time.perf_counter() - stage_start) * 1000.0,
+                        )
 
                 # Semantic
+                warmup_stage = "semantic_generation"
+                stage_start = time.perf_counter()
                 if halss_result is not None:
                     bev_data = halss_result.get("bev_data", halss_result)
                     sem_map = self.sem_gen.generate(bev_data)
                 else:
                     sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
+                if warmup_profile is not None:
+                    warmup_profile["semantic_generation_ms"] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000.0
 
                 # Depth
+                warmup_stage = "depth_projection"
+                stage_start = time.perf_counter()
                 if self._projection_mode == "training_camera":
                     sparse_depth, valid_mask, sem_map, _ = project_training_camera(
                         projection_pts, sem_map, roi_bounds, self._training_camera,
@@ -2119,58 +2535,113 @@ class OrinLandingPipeline:
                         half_x=dyn_half_x, half_y=dyn_half_y,
                     )
                     valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
+                if warmup_profile is not None:
+                    warmup_profile["depth_projection_ms"] = (
+                        time.perf_counter() - stage_start
+                    ) * 1000.0
+                warmup_stage = "observation_generation"
                 rendered_depth = render_sparse_depth(sparse_depth, valid_mask, self.depth_max)
 
                 # DRL inference (the main warmup target)
-                action_id, _ = self.drl.predict(rendered_depth, sem_map)
+                warmup_stage = "onnx_inference"
+                action_id, _ = self.drl.predict(
+                    rendered_depth, sem_map, profile=warmup_profile,
+                )
                 action_name = self.decomposer.action_id_to_name(action_id)
 
                 dt = (time.perf_counter() - t0) * 1000
-                cloud_stamp = self.fastlio.points_stamp
                 result_age_ms = dt
                 if cloud_stamp is not None:
                     result_age_ms = max(
                         result_age_ms,
                         (self._ros_time_now_s() - float(cloud_stamp)) * 1000.0,
                     )
-                if cold_pass_cloud_seq is None:
-                    cold_pass_cloud_seq = cloud_seq
+                if phase == "cold":
+                    # Drop the cold input plus all clouds accumulated while CUDA
+                    # initialized. Fresh validation starts with its own timer.
+                    latest_cloud_seq = int(
+                        getattr(self.fastlio, "points_seq", cloud_seq)
+                    )
+                    fresh_after_cloud_seq = max(int(cloud_seq), latest_cloud_seq)
                     print(
                         f"  Warmup cold pass: act={action_id}({action_name}) "
-                        f"dt={dt:.0f}ms; validating on a fresh frame...",
+                        f"dt={dt:.0f}ms; waiting for cloud_seq>"
+                        f"{fresh_after_cloud_seq} with a new {self.fresh_validation_timeout_s:.1f}s budget...",
                         flush=True,
                     )
+                    phase = "fresh"
+                    phase_start = time.perf_counter()
+                    last_wait_log = 0.0
+                    last_wait_reason = None
                     await asyncio.sleep(0.01)
                     continue
                 if result_age_ms > self.max_inference_result_age_ms:
-                    print(
-                        f"  Warmup rejected: dt={dt:.0f}ms result_age={result_age_ms:.0f}ms exceeds "
-                        f"max_inference_result_age_ms={self.max_inference_result_age_ms:.0f}ms",
-                        flush=True,
+                    # Clouds received during this rejected inference are already
+                    # stale relative to its completion; wait for a newer one.
+                    fresh_after_cloud_seq = max(
+                        int(fresh_after_cloud_seq),
+                        int(getattr(self.fastlio, "points_seq", cloud_seq)),
                     )
-                    return False
+                    report_wait(
+                        "result_too_old",
+                        f"dt={dt:.0f}ms result_age={result_age_ms:.0f}ms "
+                        f"limit={self.max_inference_result_age_ms:.0f}ms "
+                        f"next_cloud_seq>{fresh_after_cloud_seq}",
+                    )
+                    await asyncio.sleep(0.01)
+                    continue
                 print(
                     f"  Warmup validated: act={action_id}({action_name}) "
                     f"dt={dt:.0f}ms result_age={result_age_ms:.0f}ms "
                     f"<= {self.max_inference_result_age_ms:.0f}ms",
                     flush=True,
                 )
-                return True
+                return int(cloud_seq)
             except Exception as e:
-                print(f"  Warmup error: {e}, retrying...", flush=True)
+                wait_counts[phase]["inference_error"] = (
+                    wait_counts[phase].get("inference_error", 0) + 1
+                )
+                if warmup_profile is not None:
+                    try:
+                        self._log_profile_failure(warmup_profile, warmup_stage, e)
+                    except Exception as log_error:
+                        logger.warning("[Profiling] Failed to log warmup error: %s", log_error)
+                if phase == "fresh":
+                    fresh_after_cloud_seq = max(
+                        int(fresh_after_cloud_seq),
+                        int(getattr(self.fastlio, "points_seq", cloud_seq)),
+                    )
+                print(
+                    f"  Warmup {phase} error at {warmup_stage}: {e}; retrying...",
+                    flush=True,
+                )
                 await asyncio.sleep(0.2)
 
-        print(f"  Warmup timeout after {timeout_s}s — requesting manual takeover", flush=True)
-        return False
+    async def _vertical_takeoff(
+        self,
+        target_altitude_m: float,
+        target_enu: np.ndarray = None,
+    ) -> bool:
+        """Move from the manual handoff point to the configured 3-D staging point.
 
-    async def _vertical_takeoff(self, target_altitude_m: float) -> bool:
-        """Move from the manual handoff point to launch-origin staging altitude.
-
-        1a. Velocity climb to target altitude
+        1a. Limited proportional velocity to target position and altitude
         1b. Position hold + fixed-yaw stabilization
         """
         home_enu = self._home_enu
-        target_z = float(home_enu[2]) + target_altitude_m
+        if target_enu is None:
+            target_enu = np.array(
+                [
+                    home_enu[0],
+                    home_enu[1],
+                    float(home_enu[2]) + target_altitude_m,
+                ],
+                dtype=np.float32,
+            )
+        else:
+            target_enu = np.asarray(target_enu, dtype=np.float32)
+        target_x = float(target_enu[0])
+        target_y = float(target_enu[1])
+        target_z = float(target_enu[2])
         # Do not reuse the policy's 10 m/s DESCEND action magnitude for takeoff.
         # Mission guidance has its own conservative vertical-speed setting.
         climb_speed = float(
@@ -2178,26 +2649,38 @@ class OrinLandingPipeline:
         )
         climb_timeout_s = float(self._goto_max_time_s)
 
-        logger.info("[Takeoff] Phase 1: climbing to %.1fm @ %.1f m/s (timeout=%.0fs)...",
-                   target_altitude_m, climb_speed, climb_timeout_s)
+        logger.info(
+            "[Takeoff] Phase 1: staging_mode=%s target_enu=(%.2f, %.2f, %.2f) "
+            "alt=%.1fm vertical_limit=%.1fm/s timeout=%.0fs",
+            self._takeoff_staging_mode,
+            target_x, target_y, target_z,
+            target_altitude_m, climb_speed, climb_timeout_s,
+        )
         climb_start = time.perf_counter()
         last_log = 0.0
 
-        # 1a. Proportional 3-D velocity, returning over the ground launch point.
+        # 1a. Proportional 3-D velocity to the selected staging point.
         while True:
             current = np.asarray(self.fc.uavPosENU, dtype=np.float32)
-            dx = float(home_enu[0] - current[0])
-            dy = float(home_enu[1] - current[1])
+            dx = float(target_x - current[0])
+            dy = float(target_y - current[1])
             dz = float(target_z - current[2])
             dist_xy = math.hypot(dx, dy)
             if dist_xy <= self._goto_tolerance_xy and abs(dz) <= self._goto_tolerance_z:
-                logger.info("[Takeoff] Reached target altitude %.2fm in %.1fs",
-                           current[2] - float(home_enu[2]), time.perf_counter() - climb_start)
+                logger.info(
+                    "[Takeoff] Reached staging point at height %.2fm in %.1fs",
+                    current[2] - float(home_enu[2]),
+                    time.perf_counter() - climb_start,
+                )
                 break
             if time.perf_counter() - climb_start > climb_timeout_s:
                 logger.error("[Takeoff] Timeout %.0fs at height %.2fm XY error %.2fm",
                              climb_timeout_s, current[2] - float(home_enu[2]), dist_xy)
-                break
+                await self.fc.send_position_enu_yaw(
+                    float(current[0]), float(current[1]), float(current[2]),
+                    self._pre_goto_yaw_enu_deg,
+                )
+                return False
             vx, vy = _limited_xy_velocity(
                 dx, dy, self._goto_max_horizontal_speed_mps or 2.0,
                 self._goto_horizontal_kp_s,
@@ -2212,26 +2695,30 @@ class OrinLandingPipeline:
                 last_log = now
             await asyncio.sleep(0.05)
 
-        # 1b. Position hold + fixed-yaw stabilization
-        logger.info("[Takeoff] Stabilizing at %.1fm...", target_altitude_m)
+        # 1b. Once the live arrival check passes, hold the staging position and
+        # start the configured yaw-rate for 2 s. Do not reject the arrival with
+        # a second one-shot position sample after the hover.
+        logger.info(
+            "[Takeoff] Staging hover with yaw_rate=%.3frad/s for 2.0s at %.1fm...",
+            self.yaw_rate_cmd,
+            target_altitude_m,
+        )
+        self._log_mission_event(
+            "STAGING_YAW_STARTED",
+            reason=f"yaw_rate_rad_s={self.yaw_rate_cmd:.6f};duration_s=2.0",
+        )
         for _ in range(20):  # ~2s
-            await self.fc.send_position_enu_yaw(
-                float(home_enu[0]), float(home_enu[1]), target_z,
-                self._pre_goto_yaw_enu_deg,
+            await self.fc.send_position_enu_yaw_rate(
+                target_x, target_y, target_z,
+                self.yaw_rate_cmd,
             )
             await asyncio.sleep(0.1)
-        logger.info("[Takeoff] Phase 1 complete.")
-        final = np.asarray(
-            self.fc.uavPosENU if hasattr(self.fc, "uavPosENU") else np.full(3, np.nan),
-            dtype=np.float64,
+        self._log_mission_event(
+            "STAGING_YAW_COMPLETE",
+            reason=f"yaw_rate_rad_s={self.yaw_rate_cmd:.6f};duration_s=2.0",
         )
-        final_xy_error = float(np.linalg.norm(final[:2] - np.asarray(home_enu[:2])))
-        final_z_error = abs(float(final[2]) - target_z)
-        return bool(
-            np.isfinite(final).all()
-            and final_xy_error <= self._goto_tolerance_xy
-            and final_z_error <= self._goto_tolerance_z
-        )
+        logger.info("[Takeoff] Phase 1 complete after staging yaw-rate hover.")
+        return True
 
     async def _goto_safe_point(self):
         """Phase 2: Move to global safe point with position + yaw_rate control.
@@ -2267,8 +2754,8 @@ class OrinLandingPipeline:
             self._goto_tolerance_xy, self._goto_tolerance_z, speed_text,
         )
 
-        # GOTO_SAFE is the deliberate yaw-fault start boundary. Seed the
-        # heartbeat before checking arrival.
+        # Continue the yaw-rate started during the staging hover and seed the
+        # GOTO heartbeat before checking arrival.
         current_enu = self.fc.uavPosENU if hasattr(self.fc, "uavPosENU") else np.zeros(3)
         goto_vx = goto_vy = goto_vz = 0.0
         if self._goto_max_horizontal_speed_mps is None:
@@ -2302,22 +2789,55 @@ class OrinLandingPipeline:
             if dist_xy <= self._goto_tolerance_xy and dist_z <= self._goto_tolerance_z:
                 elapsed = time.perf_counter() - goto_start
                 logger.info(
-                    "[GOTO_SAFE] Arrived. XY error=%.2fm Z error=%.2fm time=%.1fs",
+                    "[GOTO_SAFE] Position captured. XY error=%.2fm Z error=%.2fm time=%.1fs",
                     dist_xy, dist_z, elapsed,
                 )
-                # Replace the last velocity setpoint immediately. GPU warmup
-                # follows GOTO and must hold the reached safe point.
-                await self.fc.send_position_enu_yaw_rate(
-                    target_enu_x, target_enu_y, target_enu_z, self.yaw_rate_cmd
-                )
-                self._apply_state_decision(self.state_manager.mark_goto_arrived(
-                    reason="goto_safe_arrived_local" if self._indoor_local_mode else "goto_safe_arrived"
-                ))
                 self._log_mission_event(
-                    "GOTO_ARRIVED",
+                    "GOTO_POSITION_CAPTURED",
                     reason=f"xy_error_m={dist_xy:.3f};z_error_m={dist_z:.3f}",
                 )
-                break
+                stabilization = await self._stabilize_at_safe_point(
+                    target_enu_x, target_enu_y, target_enu_z,
+                )
+                if stabilization == "stable":
+                    current_enu = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+                    final_xy = math.hypot(
+                        target_enu_x - float(current_enu[0]),
+                        target_enu_y - float(current_enu[1]),
+                    )
+                    final_z = abs(target_enu_z - float(current_enu[2]))
+                    self._apply_state_decision(self.state_manager.mark_goto_arrived(
+                        reason=(
+                            "goto_safe_arrived_local"
+                            if self._indoor_local_mode else "goto_safe_arrived_stable"
+                        )
+                    ))
+                    self._log_mission_event(
+                        "GOTO_ARRIVED",
+                        reason=f"xy_error_m={final_xy:.3f};z_error_m={final_z:.3f};attitude_stable=1",
+                    )
+                    break
+                if stabilization == "timeout":
+                    self._apply_state_decision(self.state_manager.reset(
+                        state=MissionState.HOLD_FOR_MANUAL,
+                        reason="safe_point_stabilization_timeout",
+                    ))
+                    self._log_mission_event(
+                        "MANUAL_TAKEOVER_REQUESTED",
+                        reason="safe_point_stabilization_timeout",
+                    )
+                    break
+                logger.info(
+                    "[GOTO_SAFE] Position left %.2fm/%.2fm capture tolerance; reacquiring",
+                    self._goto_tolerance_xy,
+                    self._goto_tolerance_z,
+                )
+                current_enu = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+                dist_xy = math.hypot(
+                    target_enu_x - float(current_enu[0]),
+                    target_enu_y - float(current_enu[1]),
+                )
+                dist_z = abs(target_enu_z - float(current_enu[2]))
 
             elapsed = time.perf_counter() - goto_start
             if elapsed > self._goto_max_time_s:
@@ -2373,6 +2893,114 @@ class OrinLandingPipeline:
                 )
             self.step_count += 1
             await asyncio.sleep(0.1)
+
+    async def _stabilize_at_safe_point(
+        self,
+        target_enu_x: float,
+        target_enu_y: float,
+        target_enu_z: float,
+    ) -> str:
+        """Command zero translation + yaw-rate until tilt is continuously stable.
+
+        Returns ``stable`` when the position remains inside the configured GOTO
+        tolerance and roll/pitch stay below the tilt limit for the required
+        duration. Returns ``reacquire`` if position leaves the capture region,
+        or ``timeout`` if attitude does not settle in time.
+        """
+        start = time.perf_counter()
+        stable_since = None
+        last_log = 0.0
+        max_tilt_deg = math.degrees(self._safe_stabilization_max_tilt_rad)
+        logger.info(
+            "[GOTO_STABLE] Zero-velocity yaw-rate hold: tol_xy=%.2fm tol_z=%.2fm "
+            "max_tilt=%.1fdeg stable_for=%.1fs timeout=%.1fs",
+            self._goto_tolerance_xy,
+            self._goto_tolerance_z,
+            max_tilt_deg,
+            self._safe_stabilization_duration_s,
+            self._safe_stabilization_timeout_s,
+        )
+
+        while True:
+            now = time.perf_counter()
+            if self.fc is not None and (
+                getattr(self.fc, "isOffboard", None) is False
+                or getattr(self.fc, "isArmed", None) is False
+            ):
+                logger.warning(
+                    "[GOTO_STABLE] Cancelled because vehicle left armed OFFBOARD"
+                )
+                return "timeout"
+            current = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+            dist_xy = math.hypot(
+                target_enu_x - float(current[0]),
+                target_enu_y - float(current[1]),
+            )
+            dist_z = abs(target_enu_z - float(current[2]))
+            roll = abs(float(getattr(self.fc, "uavRollENU", 0.0)))
+            pitch = abs(float(getattr(self.fc, "uavPitchENU", 0.0)))
+            tilt_ok = (
+                roll <= self._safe_stabilization_max_tilt_rad
+                and pitch <= self._safe_stabilization_max_tilt_rad
+            )
+
+            # This is deliberately a pure velocity-zero command. It removes the
+            # large translation-induced tilt while preserving configured yaw-rate.
+            await self.fc.send_velocity_enu_yaw_rate(
+                0.0, 0.0, 0.0, self.yaw_rate_cmd,
+            )
+
+            if dist_xy > self._goto_tolerance_xy or dist_z > self._goto_tolerance_z:
+                logger.warning(
+                    "[GOTO_STABLE] Position drifted out: xy=%.2fm z=%.2fm; resume GOTO",
+                    dist_xy,
+                    dist_z,
+                )
+                return "reacquire"
+
+            if tilt_ok:
+                if stable_since is None:
+                    stable_since = now
+                stable_duration = now - stable_since
+                if stable_duration >= self._safe_stabilization_duration_s:
+                    logger.info(
+                        "[GOTO_STABLE] Stable: xy=%.2fm z=%.2fm roll=%.1fdeg "
+                        "pitch=%.1fdeg duration=%.1fs",
+                        dist_xy,
+                        dist_z,
+                        math.degrees(roll),
+                        math.degrees(pitch),
+                        stable_duration,
+                    )
+                    return "stable"
+            else:
+                stable_since = None
+                stable_duration = 0.0
+
+            if now - start >= self._safe_stabilization_timeout_s:
+                logger.warning(
+                    "[GOTO_STABLE] Timeout: xy=%.2fm z=%.2fm roll=%.1fdeg pitch=%.1fdeg",
+                    dist_xy,
+                    dist_z,
+                    math.degrees(roll),
+                    math.degrees(pitch),
+                )
+                return "timeout"
+
+            if now - last_log >= 0.5:
+                logger.info(
+                    "[GOTO_STABLE] xy=%.2fm z=%.2fm roll=%.1fdeg pitch=%.1fdeg "
+                    "stable=%.1f/%.1fs yaw_rate=%.2f",
+                    dist_xy,
+                    dist_z,
+                    math.degrees(roll),
+                    math.degrees(pitch),
+                    0.0 if stable_since is None else now - stable_since,
+                    self._safe_stabilization_duration_s,
+                    self.yaw_rate_cmd,
+                )
+                last_log = now
+            await asyncio.sleep(0.05)
 
     async def _hold_for_manual_takeover(self):
         """Hold the current PX4 pose until the pilot exits OFFBOARD or disarms."""
@@ -2450,22 +3078,37 @@ class OrinLandingPipeline:
     # Data/logging
     # ------------------------------------------------------------------
 
-    def _grab_latest_snapshot(self):
-        """Return one immutable FAST-LIO cloud/pose snapshot for one control decision."""
+    def _grab_latest_snapshot(self, profile: dict = None):
+        """Return one immutable cloud/pose snapshot for one control decision."""
+        cloud_read_start = time.perf_counter() if profile is not None else None
         pts = self.fastlio.points
         cloud_seq = self.fastlio.points_seq
         pose_seq = self.fastlio.pose_seq
         if pts is None:
             return None, None, -1, -1, None
-        if self._use_body_cloud:
+
+        pts_snapshot = pts.copy()
+        if profile is not None:
+            now_perf = time.perf_counter()
+            profile["cloud_receive_time_ms"] = (now_perf - cloud_read_start) * 1000.0
+            received_perf = getattr(self.fastlio, "points_received_perf", None)
+            profile["cloud_age_ms"] = (
+                max(0.0, (now_perf - received_perf) * 1000.0)
+                if received_perf is not None else None
+            )
+            profile["cloud_points"] = int(len(pts_snapshot))
+            profile["cloud_stamp_ros_s"] = self.fastlio.points_stamp
+            pose_read_start = time.perf_counter()
+
+        if self._use_body_cloud and self._px4_pose_authoritative:
             if self.fc is None or self.fastlio.points_stamp is None:
-                return pts.copy(), None, cloud_seq, pose_seq, None
+                return pts_snapshot, None, cloud_seq, pose_seq, None
             sample = self.fc.get_odom_nearest(
                 self.fastlio.points_stamp,
                 max_delta_ms=self.max_cloud_odom_sync_ms,
             )
             if sample is None:
-                return pts.copy(), None, cloud_seq, pose_seq, None
+                return pts_snapshot, None, cloud_seq, pose_seq, None
             pos = sample["position_enu"]
             pose = np.array([
                 pos[0], pos[1], pos[2],
@@ -2474,19 +3117,44 @@ class OrinLandingPipeline:
                 # field remains ENU yaw for logging and local geometry only.
                 sample["yaw_enu"],
             ], dtype=np.float32)
-            return pts.copy(), pose, cloud_seq, pose_seq, float(sample["sync_ms"])
+            if profile is not None:
+                now_perf = time.perf_counter()
+                profile["pose_receive_time_ms"] = (now_perf - pose_read_start) * 1000.0
+                received_perf = sample.get("received_perf")
+                profile["pose_age_ms"] = (
+                    max(0.0, (now_perf - received_perf) * 1000.0)
+                    if received_perf is not None else None
+                )
+                profile["pose_stamp_ros_s"] = sample.get("stamp")
+                profile["cloud_pose_sync_ms"] = float(sample["sync_ms"])
+            return pts_snapshot, pose, cloud_seq, pose_seq, float(sample["sync_ms"])
+
+        # World-cloud mode and indoor body-cloud mode both synchronize against
+        # FAST-LIO odometry. In full-SLAM mode /ali_odom and
+        # /cloud_registered_body are published from the same mapping cycle.
         pose = self.fastlio.pose
         sync_ms = self.fastlio.sync_delta_ms
         if pose is None:
             return None, None, -1, -1, None
-        return pts.copy(), pose.copy(), cloud_seq, pose_seq, sync_ms
+        pose_snapshot = pose.copy()
+        if profile is not None:
+            now_perf = time.perf_counter()
+            profile["pose_receive_time_ms"] = (now_perf - pose_read_start) * 1000.0
+            received_perf = getattr(self.fastlio, "pose_received_perf", None)
+            profile["pose_age_ms"] = (
+                max(0.0, (now_perf - received_perf) * 1000.0)
+                if received_perf is not None else None
+            )
+            profile["pose_stamp_ros_s"] = self.fastlio.pose_stamp
+            profile["cloud_pose_sync_ms"] = sync_ms
+        return pts_snapshot, pose_snapshot, cloud_seq, pose_seq, sync_ms
 
     def _record_timing(
         self, halss, depth, completion, rl, control, total, *,
         cloud_stamp_ros_s=None, cloud_seq=-1, pose_seq=-1, state="",
         sync_ms=None, source_age_ms=None, result_age_ms=None, newer_frames=0,
         accepted=True, fallback_reason="", perception_executed=False,
-        pointcloud_preprocess_s=0.0,
+        pointcloud_preprocess_s=0.0, detailed_profile=None,
     ):
         self._timing["halss"].append(halss * 1000.0)
         self._timing["depth"].append(depth * 1000.0)
@@ -2513,6 +3181,7 @@ class OrinLandingPipeline:
                 newer_frames=newer_frames,
                 accepted=accepted,
                 fallback_reason=fallback_reason,
+                detailed_profile=detailed_profile,
             )
 
     def _apply_state_decision(self, decision):
@@ -2842,14 +3511,10 @@ class OrinLandingPipeline:
         self._frame_timing_path = self._run_dir / "frame_timing.csv"
         self._frame_timing_file = open(str(self._frame_timing_path), "w", newline="")
         self._frame_timing_writer = csv.writer(self._frame_timing_file)
-        self._frame_timing_writer.writerow([
-            "timestamp_ros_s", "cloud_stamp_ros_s", "cloud_seq", "pose_seq", "state",
-            "sync_ms", "pointcloud_preprocess_ms", "halss_ms", "depth_projection_ms",
-            "depth_completion_ms", "onnx_ms", "perception_inference_ms", "control_ms",
-            "pipeline_total_ms",
-            "source_age_ms", "result_age_ms", "newer_frames", "accepted",
-            "fallback_reason",
-        ])
+        frame_timing_fields = list(FRAME_TIMING_BASE_FIELDS)
+        if getattr(self, "enable_detailed_profiling", False):
+            frame_timing_fields.extend(FRAME_TIMING_DETAILED_FIELDS)
+        self._frame_timing_writer.writerow(frame_timing_fields)
         self._frame_timing_file.flush()
 
         self._perception_gate_path = self._run_dir / "perception_gate_log.csv"
@@ -2906,6 +3571,9 @@ class OrinLandingPipeline:
             "obs_size": [self.obs_h, self.obs_w],
             "yaw_rate_rad_s": self.yaw_rate_cmd,
             "sim_dt": self.sim_dt,
+            "profiling_enabled": self.enable_detailed_profiling,
+            "cold_warmup_timeout_s": self.cold_warmup_timeout_s,
+            "fresh_validation_timeout_s": self.fresh_validation_timeout_s,
             "fc_backend": self._fc_backend,
             "fc_mavros_ns": self._mavros_ns,
             "localization_mode": self.localization_mode,
@@ -2913,10 +3581,23 @@ class OrinLandingPipeline:
             "external_pose_topic": self.external_pose_topic,
             "perception_cloud_topic": self.fastlio_cloud_topic,
             "perception_cloud_frame": "lidar_imu_body" if self._use_body_cloud else "fastlio_world",
-            "control_pose_source": "px4_ekf" if self._use_body_cloud else "fastlio_or_fallback",
+            "control_pose_source": (
+                "px4_ekf" if self._px4_pose_authoritative else "fastlio_or_fallback"
+            ),
             "height_source": self.state_manager.height_source,
             "goto_max_horizontal_speed_mps": self._goto_max_horizontal_speed_mps,
             "goto_max_vertical_speed_mps": self._goto_max_vertical_speed_mps,
+            "goto_tolerance_xy_m": self._goto_tolerance_xy,
+            "goto_tolerance_z_m": self._goto_tolerance_z,
+            "safe_point_stabilization_max_tilt_deg": math.degrees(
+                self._safe_stabilization_max_tilt_rad
+            ),
+            "safe_point_stabilization_duration_s": self._safe_stabilization_duration_s,
+            "safe_point_stabilization_timeout_s": self._safe_stabilization_timeout_s,
+            "takeoff_staging_mode": self._takeoff_staging_mode,
+            "takeoff_staging_lat": self._takeoff_staging_lat,
+            "takeoff_staging_lon": self._takeoff_staging_lon,
+            "takeoff_staging_altitude_m": self._takeoff_staging_altitude_m,
             "rosbag_topics": self.cfg.get("experiment_recording", {}).get("bag_topics", []),
             "git_summary": self._git_summary(),
         }
@@ -3133,7 +3814,7 @@ class OrinLandingPipeline:
         fastlio_pose = np.pad(
             fastlio_pose, (0, max(0, 3 - fastlio_pose.size)), constant_values=np.nan
         )
-        height_pose = enu if self._use_body_cloud else fastlio_pose[:3]
+        height_pose = enu if self._px4_pose_authoritative else fastlio_pose[:3]
         height_m = self.state_manager.height_from_pose(tuple(height_pose))
         self._event_log_writer.writerow([
             event,
@@ -3157,14 +3838,14 @@ class OrinLandingPipeline:
         self, *, cloud_stamp_ros_s, cloud_seq, pose_seq, state, sync_ms,
         pointcloud_preprocess_ms, halss_ms, depth_ms, completion_ms, onnx_ms, control_ms,
         pipeline_total_ms, source_age_ms, result_age_ms, newer_frames,
-        accepted, fallback_reason,
+        accepted, fallback_reason, detailed_profile=None,
     ) -> None:
         if self._frame_timing_writer is None:
             return
         perception_inference_ms = (
             pointcloud_preprocess_ms + halss_ms + depth_ms + completion_ms + onnx_ms
         )
-        self._frame_timing_writer.writerow([
+        row = [
             f"{self._ros_time_now_s():.6f}",
             self._csv_float(cloud_stamp_ros_s, 6),
             cloud_seq,
@@ -3184,9 +3865,60 @@ class OrinLandingPipeline:
             int(newer_frames),
             "1" if accepted else "0",
             fallback_reason,
-        ])
+        ]
+        if getattr(self, "enable_detailed_profiling", False):
+            profile = detailed_profile or {}
+            timestamp = profile.get("timestamp", self._ros_time_now_s())
+            for field in FRAME_TIMING_DETAILED_FIELDS:
+                value = profile.get(field)
+                if field == "timestamp":
+                    row.append(self._csv_float(timestamp, 6))
+                elif field in {"frame_id", "cloud_points", "valid_projection_points",
+                               "halss_mc_samples", "obs_nan_count", "obs_inf_count",
+                               "action_id"}:
+                    row.append("n/a" if value is None else str(int(value)))
+                elif field in {"action_name", "stage_error", "error_message"}:
+                    row.append("" if value is None else str(value))
+                else:
+                    row.append(self._csv_float(value, 3))
+        self._frame_timing_writer.writerow(row)
         if int(cloud_seq) % 10 == 0:
             self._frame_timing_file.flush()
+
+    def _log_profile_failure(self, profile: dict, stage: str, error: Exception) -> None:
+        """Persist the partial frame profile before propagating flight fallback."""
+        if (not getattr(self, "enable_detailed_profiling", False)
+                or self._frame_timing_writer is None):
+            return
+        profile = dict(profile or {})
+        profile["stage_error"] = stage or "unknown"
+        profile["error_message"] = f"{type(error).__name__}: {error}"
+        start = profile.get("frame_start_perf")
+        if start is not None:
+            profile["frame_total_ms"] = (time.perf_counter() - start) * 1000.0
+        self._log_frame_timing(
+            cloud_stamp_ros_s=profile.get("cloud_stamp_ros_s"),
+            cloud_seq=profile.get("cloud_seq", -1),
+            pose_seq=profile.get("pose_seq", -1),
+            state=profile.get("state", self.mission_state),
+            sync_ms=profile.get("cloud_pose_sync_ms"),
+            pointcloud_preprocess_ms=profile.get("halss_projection_ms", 0.0) or 0.0,
+            halss_ms=profile.get("halss_total_ms", 0.0) or 0.0,
+            depth_ms=profile.get("depth_projection_ms", 0.0) or 0.0,
+            completion_ms=profile.get("depth_completion_ms", 0.0) or 0.0,
+            onnx_ms=profile.get("onnx_inference_ms", 0.0) or 0.0,
+            control_ms=profile.get("control_total_ms", 0.0) or 0.0,
+            pipeline_total_ms=profile.get("frame_total_ms", 0.0) or 0.0,
+            source_age_ms=profile.get("cloud_age_ms"),
+            result_age_ms=None,
+            newer_frames=0,
+            accepted=False,
+            fallback_reason="stage_error",
+            detailed_profile=profile,
+        )
+        # Failure rows must survive the following safety transition even when
+        # the regular success-path CSV buffer has not reached its flush cadence.
+        self._frame_timing_file.flush()
 
     def _log_perception_gate(
         self, cloud_seq, pose_seq, sync_ms, px4_pose,
@@ -3326,8 +4058,6 @@ def main():
                         help="lon_left,lat_bottom,lon_right,lat_top")
     parser.add_argument("--yaw-rate-rad-s", type=float, default=None,
                         help="Override uav.yaw_rate_rad_s for this experiment run")
-    parser.add_argument("--allow-high-yaw-rate-test", action="store_true",
-                        help="Explicitly allow body-cloud yaw-rate tests above 1 and up to 5rad/s")
     parser.add_argument("--onnx-model", type=str, default=None,
                         help="ONNX DRL policy path (default: decision.onnx_model_path)")
     parser.add_argument("--dmax", type=float, default=None,

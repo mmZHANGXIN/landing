@@ -18,6 +18,7 @@ import cv2
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 from scipy import interpolate
 
 
@@ -289,7 +290,7 @@ class HALSSBayesianEvaluator:
     # 主入口
     # --------------------------------------------------------
     def evaluate(self, points_world: np.ndarray, pcd_full=None,
-                 fixed_bounds: dict = None) -> dict:
+                 fixed_bounds: dict = None, profile: dict = None) -> dict:
         """
         输入: 世界坐标点云 (N,3)
         可选: fixed_bounds = {"x_min","x_max","y_min","y_max"}
@@ -299,13 +300,28 @@ class HALSSBayesianEvaluator:
         if points_world is None or len(points_world) < 10:
             return None
 
+        total_start = time.perf_counter() if profile is not None else None
         pts = points_world.astype(np.float64)
 
         # 1. surface normal
-        surf_norm = self._pc_to_surf_normal(pts, fixed_bounds=fixed_bounds)  # (H,W,3) uint8
+        projection_start = time.perf_counter() if profile is not None else None
+        try:
+            surf_norm = self._pc_to_surf_normal(pts, fixed_bounds=fixed_bounds)  # (H,W,3) uint8
+        finally:
+            if profile is not None:
+                profile["halss_surface_projection_ms"] = (
+                    time.perf_counter() - projection_start
+                ) * 1000.0
 
         # 2. MC Dropout 推理
-        mean_map, var_map = self._run_mc_inference(surf_norm)  # (H,W) float
+        network_start = time.perf_counter() if profile is not None else None
+        try:
+            mean_map, var_map = self._run_mc_inference(surf_norm)  # (H,W) float
+        finally:
+            if profile is not None:
+                profile["halss_network_ms"] = (
+                    time.perf_counter() - network_start
+                ) * 1000.0
 
         # 3. 归一化方差 + 缩放到点云范围
         var_norm = _normalize(var_map)
@@ -333,7 +349,7 @@ class HALSSBayesianEvaluator:
         safety_map = safety_map.astype(np.uint8)
         safe_mesh = safety_map > 0
 
-        return {
+        result = {
             "safety_probs": (mean_map.clip(0, 1) * (255 - var_norm_full * 255) / 255.0).ravel(),
             "safe_mesh": safe_mesh,
             "bev_data": {
@@ -347,6 +363,12 @@ class HALSSBayesianEvaluator:
             "surf_norm_rgb": surf_norm,
             "safety_map_vis": safety_map,
         }
+        if profile is not None:
+            profile["halss_total_ms"] = (
+                time.perf_counter() - total_start
+            ) * 1000.0
+            profile["halss_mc_samples"] = int(self.mc_samples)
+        return result
 
     # --------------------------------------------------------
     # 可视化 (兼容 pipeline)

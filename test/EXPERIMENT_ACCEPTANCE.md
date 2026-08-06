@@ -134,7 +134,7 @@ yaw-aware velocity control.
 | Yaw rate is configured | inspect config | `uav.yaw_rate_rad_s` set to experiment value, not `0.0`, for yaw-fault test |
 | Yaw rate can be swept without editing YAML | `python pipeline.py --flight-ready-check-only --safe-point <lat>,<lon> --depth-output-scale <scale> --yaw-rate-rad-s <rate>` | check passes and logs preview gates passed |
 | Live logs include yaw, sync, and velocity | `python test_live_nocontrol.py` | log contains `yaw=`, `yr=`, `sync=`, `v_body=`, `v_ned=` |
-| No-control test uses the same yaw/scale overrides | `python test_live_nocontrol.py --depth-output-scale <scale> --yaw-rate-rad-s <rate> --require-yaw-rate --save-raw-arrays` | startup log reports matching `yaw_rate_rad_s`, `output_scale`, `max_cloud_odom_sync_ms`, and raw arrays are saved; zero yaw-rate runs exit before ROS init |
+| No-control test uses the same yaw/scale overrides | `python test_live_nocontrol.py --depth-output-scale <scale> --yaw-rate-rad-s <rate> --save-raw-arrays` | startup log reports matching `yaw_rate_rad_s`, `output_scale`, `max_cloud_odom_sync_ms`, and raw arrays are saved |
 | No-control acceptance forbids fallback models | `python test_live_nocontrol.py --require-depth-completion --require-rl-model ...` | exits if SparseNet is unavailable or RLAgent falls back to dummy policy |
 | No-control run can be bounded automatically | `python test_live_nocontrol.py --duration-sec 120 ...` or `--max-frames 30` | process exits cleanly after the requested duration/frame count |
 | No-control log passes integrated acceptance | `python accept_nocontrol_log.py experiments/logs/nocontrol.log --expected-yaw-rate <rate> --max-total-p95-ms 100 --max-halss-p95-ms 70 --max-depth-p95-ms 15 --max-completion-p95-ms 45 --max-rl-p95-ms 30 --max-sync-p95-ms 100 --max-yaw-transform-error 0.15 --require-action-probs` | timing, module P95 budgets, cloud/odom sync P95, yaw-aware body-to-NED velocity transform error, yaw rate, valid depth, semantic ratios, action diversity, and probabilities pass |
@@ -175,7 +175,6 @@ python test_live_nocontrol.py \
   --save-frames \
   --require-depth-completion \
   --require-rl-model \
-  --require-yaw-rate \
   --duration-sec 120
 ```
 

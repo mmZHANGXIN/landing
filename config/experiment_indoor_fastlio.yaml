@@ -6,6 +6,17 @@ localization:
   mode: "fastlio_external_vision"
   px4_position_source: "external_vision"
   allow_gps_fallback: false
+  # Full FAST-LIO SLAM still publishes /cloud_registered_body. Consume it with
+  # the same perception preprocessing used outdoors, while /ali_odom remains
+  # the localization/health source.
+  use_body_cloud: true
+  fastlio_pose_required: true
+  body_cloud_topic: "/cloud_registered_body"
+  fastlio_odom_topic: "/ali_odom"
+
+perception:
+  halss_pinhole_ray_sampling_enabled: true
+  halss_pinhole_ray_grid_res: 64
 
 mission_state:
   boundary_enable: true
@@ -19,3 +30,21 @@ global_prior:
   enabled: true
   mode: "local_body_offset"
   local_body_offset_m: [0.0, 0.0, 1.5]
+
+experiment_recording:
+  enabled: true
+  required: true
+  bag_topics:
+    - "/livox/lidar"
+    - "/livox/imu"
+    - "/cloud_registered_body"
+    - "/ali_odom"
+    - "/mavros/vision_pose/pose"
+    - "/fastlio/degeneracy_metrics"
+    - "/mavros/local_position/odom"
+    - "/mavros/global_position/global"
+    - "/mavros/imu/data"
+    - "/mavros/state"
+    - "/mavros/extended_state"
+    - "/mavros/setpoint_raw/local"
+    - "/mavros/setpoint_raw/target_local"

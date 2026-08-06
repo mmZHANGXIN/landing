@@ -152,7 +152,7 @@ def _evidence_items(args):
             "experiments/logs/nocontrol.log --expected-yaw-rate <rate> --fail-on-issues",
             "python test_live_nocontrol.py --depth-output-scale <scale> "
             "--yaw-rate-rad-s <rate> --save-raw-arrays --save-frames "
-            "--require-depth-completion --require-rl-model --require-yaw-rate "
+            "--require-depth-completion --require-rl-model "
             "--duration-sec 120 "
             "2>&1 | tee experiments/logs/nocontrol.log",
             validator="nocontrol_log" if validate else None,

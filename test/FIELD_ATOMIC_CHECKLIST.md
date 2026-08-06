@@ -165,7 +165,6 @@ python test_live_nocontrol.py \
   --save-frames \
   --require-depth-completion \
   --require-rl-model \
-  --require-yaw-rate \
   --duration-sec 120 2>&1 | tee experiments/logs/nocontrol.log
 
 python analyze_timing_log.py experiments/logs/nocontrol.log --budget-ms 100 --max-p95-ms 100
@@ -193,7 +192,7 @@ python inspect_nocontrol_artifacts_light.py experiments/frames --require-frames 
 - 保存 `*_binary_semantic.png`、`*_depth.png`、`*_calib_frame.npz`。
 - `*_calib_frame.npz` 必须包含 `sparse_depth`、`valid_mask`、`dense_depth`、`sem_map`、`binary_semantic_vis`、`yaw_rad`、`cloud_odom_sync_ms`、`action_id`、`v_body`、`v_ned`。
 - 终端逐帧输出 `act=<id>(<name>)`、`H/D/C/RL/total`、`yaw`、`yr`、`sync`、`v_body`、`v_ned`、`obsD`、`obsS`、`valid`、`sem_safe`、`sem_danger`、`p=...`。
-- 启动日志输出 `max_cloud_odom_sync_ms=100`；若未设置非零 `<yaw_rate>`，`--require-yaw-rate` 会直接退出。
+- 启动日志输出 `max_cloud_odom_sync_ms=100`；yaw-rate 数值不受软件门控。
 - `sync` 表示 `/cloud_registered` 与 `/Odometry` header 时间差, P95 不超过 100 ms。
 - `v_ned` 必须与 `v_body` 按同帧 FAST-LIO `yaw` 旋转后的结果一致, yaw transform error P95 不超过 0.15 m/s。
 - `yr` 均值与 `<yaw_rate>` 一致。

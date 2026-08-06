@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Orin Landing — 离线 rosbag 回放感知 + DRL 推理管线
 ====================================================
@@ -13,7 +14,7 @@ Orin Landing — 离线 rosbag 回放感知 + DRL 推理管线
 用法:
   source /opt/ros/noetic/setup.bash
   python scripts/replay_bag_offline.py \\
-      --bag experiments/runs/20260720_174909_orin_landing/input.bag \\
+      --bag experiments/runs/20260721_175625_orin_landing/input.bag \\
       --config ./config/experiment_outdoor_gps.yaml \\
       --onnx-model weights/ppo2_policy.onnx
 """
@@ -422,7 +423,7 @@ def main():
     parser.add_argument("--world-cloud", action="store_true",
                         help="强制使用 world-cloud 模式 (/ali_cloud + /ali_odom)")
     parser.add_argument("--body-cloud", action="store_true",
-                        help="强制使用 body-cloud 模式 (/cloud_registered_body + /mavros/local_position/odom)")
+                        help="强制使用 body-cloud 模式（位姿源由 localization.mode 决定）")
     args = parser.parse_args()
 
     # ── 加载配置 ──
@@ -431,6 +432,8 @@ def main():
 
     # ── 确定话题和模式 ──
     loc_cfg = cfg.get("localization", {})
+    localization_mode = str(loc_cfg.get("mode", "")).lower()
+    px4_pose_authoritative = localization_mode == "gps_px4_fastlio_perception"
     use_body_cloud = args.body_cloud or (
         not args.world_cloud
         and bool(loc_cfg.get("use_body_cloud",
@@ -441,8 +444,13 @@ def main():
         cloud_topic = str(loc_cfg.get("body_cloud_topic", "/cloud_registered_body"))
         px4_odom_topic = "/mavros/local_position/odom"
         fastlio_odom_topic = str(loc_cfg.get("fastlio_odom_topic", "/ali_odom"))
-        logger.info("Mode: body-cloud  cloud=%s  px4_odom=%s  fastlio_odom=%s",
-                     cloud_topic, px4_odom_topic, fastlio_odom_topic)
+        body_pose_topic = px4_odom_topic if px4_pose_authoritative else fastlio_odom_topic
+        logger.info(
+            "Mode: body-cloud cloud=%s pose=%s authority=%s",
+            cloud_topic,
+            body_pose_topic,
+            "px4_ekf" if px4_pose_authoritative else "fastlio",
+        )
     else:
         cloud_topic = str(loc_cfg.get("world_cloud_topic", "/ali_cloud"))
         fastlio_odom_topic = str(loc_cfg.get("fastlio_odom_topic", "/ali_odom"))
@@ -558,12 +566,14 @@ def main():
     from sensor_msgs.msg import PointCloud2  # noqa
     from nav_msgs.msg import Odometry  # noqa
 
-    # body-cloud 需要 PX4 odom 获取 roll/pitch
+    # Body cloud needs timestamp-matched roll/pitch. Outdoor uses PX4 EKF;
+    # indoor full-SLAM uses FAST-LIO /ali_odom.
     if use_body_cloud:
         primary_cloud_topic = cloud_topic
-        primary_odom_topic = px4_odom_topic
-        secondary_odom_topic = fastlio_odom_topic
-        read_topics = [primary_cloud_topic, primary_odom_topic, secondary_odom_topic]
+        primary_odom_topic = body_pose_topic
+        read_topics = [primary_cloud_topic, primary_odom_topic]
+        if px4_pose_authoritative and fastlio_odom_topic != primary_odom_topic:
+            read_topics.append(fastlio_odom_topic)
     else:
         primary_cloud_topic = cloud_topic
         primary_odom_topic = fastlio_odom_topic
@@ -599,8 +609,8 @@ def main():
         for topic_name, msg, ros_stamp in bag.read_messages(topics=read_topics):
             stamp_sec = _stamp_to_sec(msg.header.stamp) if hasattr(msg, 'header') else _stamp_to_sec(ros_stamp)
 
-            # ── 如果是 PX4 odom (body-cloud 模式), 放入滑动窗口 ──
-            if use_body_cloud and topic_name == px4_odom_topic:
+            # ── body-cloud 匹配位姿，按场景来自 PX4 或 FAST-LIO ──
+            if use_body_cloud and topic_name == primary_odom_topic:
                 px4_odom_window.append((stamp_sec, msg))
                 continue
 
@@ -634,11 +644,11 @@ def main():
 
                 # 获取匹配的位姿
                 if use_body_cloud:
-                    # 从 PX4 odom 窗口找到最近的
+                    # 从场景指定的 odom 窗口找到最近位姿
                     if len(px4_odom_window) == 0:
-                        logger.warning("[Frame] No PX4 odom available at t=%.3f", cloud_stamp)
+                        logger.warning("[Frame] No matched odom available at t=%.3f", cloud_stamp)
                         continue
-                    # 找时间最近的 PX4 odom
+                    # 找时间最近的位姿
                     odom_times = np.array([t for t, _ in px4_odom_window])
                     nearest_idx = np.argmin(np.abs(odom_times - cloud_stamp))
                     nearest_stamp = float(odom_times[nearest_idx])
@@ -647,11 +657,11 @@ def main():
                         logger.warning("[Frame] Sync %.0fms > %.0fms at t=%.3f, skip",
                                        sync_ms, max_sync_ms, cloud_stamp)
                         continue
-                    _, px4_msg = px4_odom_window[nearest_idx]
-                    q = px4_msg.pose.pose.orientation
+                    _, pose_msg = px4_odom_window[nearest_idx]
+                    q = pose_msg.pose.pose.orientation
                     roll, pitch, _ = _quat_to_euler(q.x, q.y, q.z, q.w)
-                    # 获取 PX4 位置和 yaw (用于动作解算)
-                    p = px4_msg.pose.pose.position
+                    # 获取定位源位置和 yaw
+                    p = pose_msg.pose.pose.position
                     px4_pos = np.array([p.x, p.y, p.z], dtype=np.float32)
                     _, _, px4_yaw = _quat_to_euler(q.x, q.y, q.z, q.w)
 

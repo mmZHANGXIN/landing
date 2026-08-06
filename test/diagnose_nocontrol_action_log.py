@@ -110,7 +110,7 @@ def analyze_log(path: Path, expected_sign=-1, expected_yaw_rate=None, max_action
                 "FAIL",
                 "The run did not log the requested yaw-fault rate.",
                 f"mean_abs_yr={yaw_mean:.3f} expected={expected:.3f}+/-0.050",
-                "Rerun with --yaw-rate-rad-s <rate> and --require-yaw-rate; zero-yaw logs are not valid yaw-fault evidence.",
+                "Rerun with the intended --yaw-rate-rad-s <rate>; zero-yaw logs are not valid yaw-fault evidence.",
             ))
     elif yaw_mean <= 1e-6:
         issues.append(_issue(
@@ -118,7 +118,7 @@ def analyze_log(path: Path, expected_sign=-1, expected_yaw_rate=None, max_action
             "FAIL",
             "The run used yr=0.00, so it did not exercise the yaw-fault control path.",
             f"mean_abs_yr={yaw_mean:.3f}",
-            "Set uav.yaw_rate_rad_s or pass --yaw-rate-rad-s <rate> and --require-yaw-rate.",
+            "Set uav.yaw_rate_rad_s or pass --yaw-rate-rad-s <rate>.",
         ))
 
     action_counter = summary["actions"] if summary["count"] else legacy.get("actions", Counter())

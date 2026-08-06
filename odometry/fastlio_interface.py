@@ -5,6 +5,7 @@ FAST-LIO2 ROS1 接口
 
 import numpy as np
 import logging
+import time
 
 logger = logging.getLogger("FastLIOInterface")
 
@@ -28,6 +29,8 @@ class FastLIOInterface:
         self._latest_pose_covariance = None
         self._latest_quaternion_norm = None
         self._latest_points_stamp = None
+        self._latest_pose_received_perf = None
+        self._latest_points_received_perf = None
         self._pose_seq = 0
         self._points_seq = 0
         self._initialized = False
@@ -80,6 +83,7 @@ class FastLIOInterface:
             msg.pose.covariance, dtype=np.float64
         ).copy()
         self._latest_pose_stamp = self._stamp_to_sec(msg.header.stamp)
+        self._latest_pose_received_perf = time.perf_counter()
         self._pose_seq += 1
 
     def pointcloud_callback(self, msg):
@@ -116,6 +120,7 @@ class FastLIOInterface:
             if len(pts) > 0:
                 self._latest_points = pts
                 self._latest_points_stamp = self._stamp_to_sec(msg.header.stamp)
+                self._latest_points_received_perf = time.perf_counter()
                 self._points_seq += 1
                 self._initialized = True
         except Exception as e:
@@ -169,6 +174,16 @@ class FastLIOInterface:
         return self._latest_points_stamp
 
     @property
+    def pose_received_perf(self):
+        """Monotonic receipt time of the latest odometry callback."""
+        return self._latest_pose_received_perf
+
+    @property
+    def points_received_perf(self):
+        """Monotonic receipt time of the latest point-cloud callback."""
+        return self._latest_points_received_perf
+
+    @property
     def sync_delta_ms(self):
         """最新点云与位姿 header 时间差绝对值 (毫秒)。"""
         if self._latest_pose_stamp is None or self._latest_points_stamp is None:
@@ -183,12 +198,14 @@ class FastLIOInterface:
         """非 ROS 模式下手动设置位姿"""
         self._latest_pose = pose
         self._latest_pose_stamp = stamp
+        self._latest_pose_received_perf = time.perf_counter()
         self._pose_seq += 1
 
     def set_points(self, points: np.ndarray, stamp=None):
         """非 ROS 模式下手动设置点云"""
         self._latest_points = points
         self._latest_points_stamp = stamp
+        self._latest_points_received_perf = time.perf_counter()
         self._points_seq += 1
         self._initialized = True
 

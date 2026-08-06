@@ -8,7 +8,11 @@ from types import SimpleNamespace
 import numpy as np
 
 import pipeline as pipeline_module
-from pipeline import OrinLandingPipeline
+from pipeline import (
+    FRAME_TIMING_BASE_FIELDS,
+    FRAME_TIMING_DETAILED_FIELDS,
+    OrinLandingPipeline,
+)
 
 
 # Runtime dependencies are normally installed by OrinLandingPipeline.__init__.
@@ -91,3 +95,47 @@ def test_record_timing_writes_only_actual_perception_frames():
     assert row[13:19] == [
         "110.000", "12.000", "112.000", "2", "0", "inference_result_too_old"
     ]
+
+
+def test_detailed_frame_timing_appends_profile_and_failure_fields():
+    pipeline = OrinLandingPipeline.__new__(OrinLandingPipeline)
+    pipeline.enable_detailed_profiling = True
+    pipeline._timing = {
+        "halss": [], "depth": [], "completion": [], "rl": [], "control": [], "total": []
+    }
+    pipeline._rospy = None
+    pipeline.mission_state = "DRL_DESCENT"
+    output = _FlushableStringIO()
+    pipeline._frame_timing_file = output
+    pipeline._frame_timing_writer = csv.writer(output)
+
+    profile = {
+        "frame_id": 7,
+        "timestamp": 101.25,
+        "cloud_points": 2400,
+        "valid_projection_points": 900,
+        "halss_mc_samples": 5,
+        "action_id": 9,
+        "action_name": "DESCEND",
+        "stage_error": "onnx_inference",
+        "error_message": "RuntimeError: test failure",
+    }
+    pipeline._log_frame_timing(
+        cloud_stamp_ros_s=100.0, cloud_seq=20, pose_seq=0,
+        state="DRL_DESCENT", sync_ms=4.0,
+        pointcloud_preprocess_ms=1.0, halss_ms=2.0, depth_ms=3.0,
+        completion_ms=4.0, onnx_ms=0.0, control_ms=0.0,
+        pipeline_total_ms=12.0, source_age_ms=8.0, result_age_ms=None,
+        newer_frames=0, accepted=False, fallback_reason="stage_error",
+        detailed_profile=profile,
+    )
+
+    row = _csv_rows(output)[0]
+    assert len(row) == len(FRAME_TIMING_BASE_FIELDS) + len(FRAME_TIMING_DETAILED_FIELDS)
+    detail = dict(zip(FRAME_TIMING_DETAILED_FIELDS, row[len(FRAME_TIMING_BASE_FIELDS):]))
+    assert detail["frame_id"] == "7"
+    assert detail["timestamp"] == "101.250000"
+    assert detail["cloud_points"] == "2400"
+    assert detail["action_name"] == "DESCEND"
+    assert detail["stage_error"] == "onnx_inference"
+    assert detail["error_message"] == "RuntimeError: test failure"

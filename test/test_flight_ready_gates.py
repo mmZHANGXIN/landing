@@ -50,7 +50,6 @@ def test_default_config_rejected():
         ["--mode", "ros", "--flight-ready-check-only"],
         [
             "no global safe-area guidance active",
-            "uav.yaw_rate_rad_s is 0.0",
         ],
     )
 

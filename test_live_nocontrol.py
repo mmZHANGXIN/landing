@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""
-无飞控在线测试 — FAST-LIO 去畸变点云 + NN-fill 深度 + ONNX DRL
-===============================================================
-订阅 /Odometry 和 /cloud_registered, 跑 HALSS + NN-fill + ONNX DRL, 实时显示, 终端打印动作和耗时。
-不发送 MAVSDK 控制指令。
+"""室内 DRL 观察悬停。
 
-用法:
-  source /opt/ros/noetic/setup.bash
-  source ~/livox_ws/devel/setup.bash
-  source ~/fast_lio_ws/devel/setup.bash
-  conda activate fylanding
-  python test_live_nocontrol.py --no-display --onnx-model weights/ppo2_policy.onnx
+复用 pipeline.py 的室内起飞和感知流程，在起飞原点上空定点偏航悬停。
+DRL 结果只显示、打印和记录，不执行其平移、下降或降落动作。正常结束方式是
+操作员切出 OFFBOARD（或 disarm）接管无人机。
 """
 
 import argparse
+import asyncio
+import math
 import sys, os, time, logging
 import numpy as np
 import cv2
@@ -39,7 +34,7 @@ import yaml
 _EARLY_PARSER = argparse.ArgumentParser(add_help=False)
 _EARLY_PARSER.add_argument(
     "--config",
-    default=os.path.join(os.path.dirname(__file__), "config", "experiment_config.yaml"),
+    default=os.path.join(os.path.dirname(__file__), "config", "experiment_indoor_fastlio.yaml"),
 )
 _EARLY_ARGS, _ = _EARLY_PARSER.parse_known_args()
 
@@ -65,6 +60,13 @@ def _load_profile(path):
 
 
 CFG = _load_profile(_EARLY_ARGS.config)
+_LOC_CFG = CFG.get("localization", {})
+USE_BODY_CLOUD = bool(
+    _LOC_CFG.get(
+        "use_body_cloud",
+        _LOC_CFG.get("mode", "") == "gps_px4_fastlio_perception",
+    )
+)
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -72,11 +74,15 @@ import rospy
 
 # ---- 感知模块 ----
 from perception.halss_bayesian import HALSSBayesianEvaluator
-from perception.halss_preprocess import world_to_level_body_roi
+from perception.halss_preprocess import (
+    body_cloud_to_level_body_roi,
+    world_to_level_body_roi,
+)
 from perception.semantic_generator import SemanticGenerator
 from perception.training_camera_projection import (
     TrainingCameraModel,
     project_training_camera,
+    sample_nearest_points_by_camera_rays,
 )
 
 # ---- 里程计 ----
@@ -84,6 +90,7 @@ from odometry import FastLIOInterface
 
 # ---- 控制 ----
 from control.action_decomposer import ActionDecomposer
+from pipeline import OrinLandingPipeline
 
 # ---- ONNX DRL ----
 try:
@@ -117,14 +124,19 @@ def _parse_args():
                         help="Save displayed binary semantic and depth frames")
     parser.add_argument("--save-dir", default=None,
                         help="Override visualization.save_dir")
-    parser.add_argument("--require-yaw-rate", action="store_true",
-                        help="Fail if the configured yaw-fault rate is zero")
     parser.add_argument("--max-frames", type=int, default=0,
                         help="Stop after N processed frames (0 = run until interrupted)")
     parser.add_argument("--duration-sec", type=float, default=0.0,
                         help="Stop after this many seconds of wall time (0 = run until interrupted)")
     parser.add_argument("--no-display", action="store_true",
                         help="Disable matplotlib live display")
+    record_group = parser.add_mutually_exclusive_group()
+    record_group.add_argument("--record-bag", action="store_true", default=None,
+                              help="Enable configured rosbag recording")
+    record_group.add_argument("--no-record-bag", action="store_true", default=None,
+                              help="Disable rosbag recording for bench debugging")
+    parser.add_argument("--allow-incomplete-experiment", action="store_true",
+                        help="Bypass strict flight-ready gates for bench debugging only")
     parser.add_argument("--onnx-model", default="weights/ppo2_policy.onnx",
                         help="Path to ONNX DRL model")
     parser.add_argument("--dmax", type=float, default=30.0,
@@ -176,7 +188,11 @@ def _init_ros_bridge(node_name: str = "live_fastlio_nocontrol_bridge") -> FastLI
 
     loc_cfg = CFG.get("localization", {})
     odom_topic = loc_cfg.get("fastlio_odom_topic", "/ali_odom")
-    cloud_topic = loc_cfg.get("world_cloud_topic", "/ali_cloud")
+    cloud_topic = (
+        loc_cfg.get("body_cloud_topic", "/cloud_registered_body")
+        if USE_BODY_CLOUD
+        else loc_cfg.get("world_cloud_topic", "/ali_cloud")
+    )
 
     fastlio = FastLIOInterface(use_ros=True)
 
@@ -590,7 +606,7 @@ class LiveDisplay:
 # 主逻辑
 # ============================================================
 
-def main():
+def _legacy_main():
     args = _parse_args()
     _apply_cli_overrides(CFG, args)
     dmax = float(args.dmax)
@@ -608,10 +624,6 @@ def main():
         CFG.get("visualization", {}).get("save_dir", "experiments/frames"),
         float(CFG.get("runtime", {}).get("max_cloud_odom_sync_ms", 100.0)),
     )
-    if args.require_yaw_rate and abs(float(CFG["uav"].get("yaw_rate_rad_s", 0.0))) < 1e-6:
-        logger.error("yaw_rate_rad_s is zero and --require-yaw-rate is set.")
-        sys.exit(2)
-
     print("Initializing ROS FAST-LIO bridge...", flush=True)
     fastlio = _init_ros_bridge()
     print("ROS FAST-LIO bridge OK.", flush=True)
@@ -675,7 +687,13 @@ def main():
     display = None if args.no_display else LiveDisplay(
         sz=300, dmax=dmax, cfg=CFG.get("visualization", {}))
 
-    print("Pipeline ready. Waiting for /cloud_registered + /Odometry...", flush=True)
+    active_cloud_topic = (
+        CFG.get("localization", {}).get("body_cloud_topic", "/cloud_registered_body")
+        if USE_BODY_CLOUD
+        else CFG.get("localization", {}).get("world_cloud_topic", "/ali_cloud")
+    )
+    active_odom_topic = CFG.get("localization", {}).get("fastlio_odom_topic", "/ali_odom")
+    print(f"Pipeline ready. Waiting for {active_cloud_topic} + {active_odom_topic}...", flush=True)
     logger.info("Pipeline ready. Waiting for FAST-LIO data...")
     logger.info("  Depth backend: %s + NN-fill", projection_mode)
     logger.info("  DRL backend:   ONNX (raw input: depth=meters, sem=gray; ONNX internal /255)")
@@ -702,6 +720,12 @@ def main():
     roi_min_half = float(CFG.get("perception", {}).get("halss_roi_min_half_m", 0.5))
     roi_max_half = float(CFG.get("perception", {}).get("halss_roi_max_half_m", 15.0))
     roi_height_src = str(CFG.get("perception", {}).get("halss_roi_height_source", "pose_z"))
+    halss_ray_sampling = bool(
+        CFG.get("perception", {}).get("halss_pinhole_ray_sampling_enabled", False)
+    )
+    halss_ray_grid = int(
+        CFG.get("perception", {}).get("halss_pinhole_ray_grid_res", 64)
+    )
     # 记录起飞点 Fast-LIO z 作为地面参考
     ground_z_world = None
     if roi_dynamic:
@@ -725,7 +749,7 @@ def main():
                 if now - last_wait_log > 3.0:
                     print(
                         "  Waiting for FAST-LIO data... "
-                        "(need /cloud_registered + /Odometry)",
+                        f"(need {active_cloud_topic} + {active_odom_topic})",
                         flush=True,
                     )
                     last_wait_log = now
@@ -772,11 +796,30 @@ def main():
             else:
                 cur_half_x, cur_half_y = half_x, half_y
 
-            # 1. HALSS 贝叶斯安全语义: 世界系点云 -> 水平机体动态 ROI
-            halss_pts, halss_stats = world_to_level_body_roi(
-                pts, pose_xyz, rpy, pcfg,
-                half_x=cur_half_x, half_y=cur_half_y,
-            )
+            # 1. HALSS 贝叶斯安全语义。Body-cloud profile uses the same
+            # rigid transform, leveling and optional ray sampling as pipeline.py.
+            if USE_BODY_CLOUD:
+                projection_pts, halss_stats = body_cloud_to_level_body_roi(
+                    pts, roll, pitch, pcfg,
+                    half_x=cur_half_x, half_y=cur_half_y,
+                )
+                if halss_ray_sampling:
+                    halss_pts, ray_stats = sample_nearest_points_by_camera_rays(
+                        projection_pts,
+                        training_camera,
+                        ray_width=halss_ray_grid,
+                        ray_height=halss_ray_grid,
+                    )
+                    halss_stats["pre_ray_points"] = int(len(projection_pts))
+                    halss_stats["frustum_points"] = int(ray_stats["frustum_points"])
+                    halss_stats["output_points"] = int(len(halss_pts))
+                else:
+                    halss_pts = projection_pts
+            else:
+                halss_pts, halss_stats = world_to_level_body_roi(
+                    pts, pose_xyz, rpy, pcfg,
+                    half_x=cur_half_x, half_y=cur_half_y,
+                )
             roi_bounds = {
                 "x_min": -cur_half_x, "x_max": cur_half_x,
                 "y_min": -cur_half_y, "y_max": cur_half_y,
@@ -965,6 +1008,406 @@ def main():
                 logger.info(f"  {action_names[i]}: {action_counts[i]} ({100*action_counts[i]/total:.1f}%)")
         rospy.signal_shutdown("test_live_nocontrol stopped")
         logger.info("Done.")
+
+
+class IndoorObservationPipeline(OrinLandingPipeline):
+    """室内定点偏航观察模式：执行悬停控制，但绝不执行 DRL 动作。"""
+
+    async def _vertical_takeoff(
+        self, target_altitude_m: float, target_enu: np.ndarray = None,
+    ) -> bool:
+        """复用主管线上升逻辑，但室内观察模式只用高度判断到达。"""
+        original_xy_tolerance = self._goto_tolerance_xy
+        self._goto_tolerance_xy = float("inf")
+        try:
+            return await super()._vertical_takeoff(
+                target_altitude_m, target_enu=target_enu,
+            )
+        finally:
+            self._goto_tolerance_xy = original_xy_tolerance
+
+    async def _goto_safe_point(self):
+        """持续锁定原点上空目标；仅目标高度进入容差即判定到达。"""
+        target_ned = np.asarray(self._safe_ned_target, dtype=np.float32)
+        target = np.array(
+            [target_ned[1], target_ned[0], -target_ned[2]],
+            dtype=np.float32,
+        )
+        start = time.perf_counter()
+        last_log = 0.0
+        logger.info(
+            "[ObserveGoto] Height-only arrival: target_z=%.2fm tolerance=%.2fm; "
+            "XY remains position-held but is not an arrival gate",
+            target[2], self._goto_tolerance_z,
+        )
+
+        while self.mission_state == "GOTO_SAFE":
+            if getattr(self.fc, "isOffboard", None) is False:
+                self.mission_state = "IDLE"
+                self._log_mission_event("MANUAL_TAKEOVER", reason="offboard_exited")
+                return
+            if getattr(self.fc, "isArmed", None) is False:
+                self.mission_state = "LANDED"
+                self._log_mission_event("DISARMED", reason="px4_disarmed")
+                return
+
+            current = np.asarray(self.fc.uavPosENU, dtype=np.float32)
+            height_error = abs(float(target[2] - current[2]))
+            await self.fc.send_position_enu_yaw_rate(
+                float(target[0]), float(target[1]), float(target[2]),
+                self.yaw_rate_cmd,
+            )
+            if height_error <= self._goto_tolerance_z:
+                self._apply_state_decision(self.state_manager.mark_goto_arrived(
+                    reason="goto_safe_height_reached_observation",
+                ))
+                self._log_mission_event(
+                    "GOTO_ARRIVED",
+                    reason=f"height_error_m={height_error:.3f};height_only=1",
+                )
+                logger.info(
+                    "[ObserveGoto] Safe height reached: z=%.2fm error=%.2fm",
+                    current[2], height_error,
+                )
+                return
+
+            now = time.perf_counter()
+            if now - start > self._goto_max_time_s:
+                logger.warning(
+                    "[ObserveGoto] Height timeout: z=%.2fm target=%.2fm error=%.2fm; "
+                    "requesting manual takeover",
+                    current[2], target[2], height_error,
+                )
+                self.mission_state = "HOLD_FOR_MANUAL"
+                self._log_mission_event(
+                    "MANUAL_TAKEOVER_REQUESTED",
+                    reason=f"safe_height_timeout;error_m={height_error:.3f}",
+                )
+                return
+            if now - last_log >= 0.5:
+                logger.info(
+                    "[ObserveGoto] z=%.2fm target=%.2fm error=%.2fm",
+                    current[2], target[2], height_error,
+                )
+                last_log = now
+            await asyncio.sleep(0.1)
+
+    def _observation_target_enu(self) -> np.ndarray:
+        if not self._indoor_local_mode or self._safe_ned_target is None:
+            raise RuntimeError(
+                "Observation hover requires indoor global_prior.mode=local_body_offset"
+            )
+        target_ned = np.asarray(self._safe_ned_target, dtype=np.float32)
+        return np.array(
+            [target_ned[1], target_ned[0], -target_ned[2]],
+            dtype=np.float32,
+        )
+
+    async def _run_descent_loop(self, start_after_cloud_seq: int = -1):
+        """Replace DRL descent with unlimited fixed-position observation hover."""
+        target = self._observation_target_enu()
+        last_processed_seq = int(start_after_cloud_seq)
+        last_warning = {}
+
+        def warn_limited(reason: str, message: str, *values) -> None:
+            now = time.perf_counter()
+            if now - last_warning.get(reason, 0.0) >= 1.0:
+                logger.warning(message, *values)
+                last_warning[reason] = now
+
+        logger.warning(
+            "[ObserveHover] DRL ACTION EXECUTION DISABLED. "
+            "Holding ENU=%s yaw_rate=%.3frad/s until pilot exits OFFBOARD.",
+            _fmt_vec(target), self.yaw_rate_cmd,
+        )
+        self._log_mission_event(
+            "OBSERVATION_HOVER_STARTED",
+            reason=(
+                f"target_enu={target.tolist()};"
+                f"yaw_rate_rad_s={self.yaw_rate_cmd:.6f}"
+            ),
+        )
+
+        while True:
+            loop_start = time.perf_counter()
+
+            # Manual takeover is authoritative. Do not publish another command
+            # after OFFBOARD has been exited or the vehicle has been disarmed.
+            if getattr(self.fc, "isOffboard", None) is False:
+                logger.warning("[ObserveHover] OFFBOARD exited; yielding to pilot")
+                self._log_mission_event("MANUAL_TAKEOVER", reason="offboard_exited")
+                self.mission_state = "IDLE"
+                break
+            if getattr(self.fc, "isArmed", None) is False:
+                logger.info("[ObserveHover] Vehicle disarmed; stopping")
+                self._log_mission_event("DISARMED", reason="px4_disarmed")
+                self.mission_state = "LANDED"
+                break
+
+            # This is the only command emitted by the observation loop. The
+            # MAVROS controller's background stream republishes it at the
+            # configured setpoint rate even while inference is running.
+            await self.fc.send_position_enu_yaw_rate(
+                float(target[0]), float(target[1]), float(target[2]),
+                self.yaw_rate_cmd,
+            )
+
+            frame_points, frame_pose, cloud_seq, pose_seq, sync_ms = (
+                self._grab_latest_snapshot()
+            )
+            if frame_points is None or frame_pose is None:
+                warn_limited(
+                    "missing_data",
+                    "[ObserveHover] Waiting for matched FAST-LIO cloud/pose; holding position",
+                )
+                await asyncio.sleep(0.02)
+                continue
+            if cloud_seq <= last_processed_seq:
+                await asyncio.sleep(0.005)
+                continue
+            last_processed_seq = cloud_seq
+            if sync_ms is None:
+                warn_limited(
+                    "sync_missing",
+                    "[ObserveHover] Missing cloud/pose timestamps at cloud_seq=%d; frame skipped",
+                    cloud_seq,
+                )
+                continue
+            if sync_ms > self.max_cloud_odom_sync_ms:
+                warn_limited(
+                    "sync_large",
+                    "[ObserveHover] cloud/pose sync %.0fms > %.0fms; frame skipped",
+                    sync_ms, self.max_cloud_odom_sync_ms,
+                )
+                continue
+
+            try:
+                control_pose = frame_pose
+                roll = abs(float(control_pose[3]))
+                pitch = abs(float(control_pose[4]))
+                if max(roll, pitch) > self.max_roll_pitch_rad:
+                    warn_limited(
+                        "attitude",
+                        "[ObserveHover] roll/pitch %.1f/%.1fdeg exceeds %.1fdeg; frame skipped",
+                        math.degrees(roll), math.degrees(pitch),
+                        math.degrees(self.max_roll_pitch_rad),
+                    )
+                    continue
+
+                dyn_half_x, dyn_half_y, _ = self._compute_roi_half_from_height(
+                    float(control_pose[2]), None,
+                )
+                self._roi_half_x = dyn_half_x
+                self._roi_half_y = dyn_half_y
+                halss_points, projection_points, halss_stats = self._prepare_halss_points(
+                    frame_points, frame_pose, control_pose,
+                    dyn_half_x, dyn_half_y,
+                )
+                roi_points = int(halss_stats.get("output_points", 0))
+                if roi_points < 10:
+                    warn_limited(
+                        "roi_sparse",
+                        "[ObserveHover] ROI sparse: %d points; frame skipped",
+                        roi_points,
+                    )
+                    continue
+
+                roi_bounds = {
+                    "x_min": -dyn_half_x, "x_max": dyn_half_x,
+                    "y_min": -dyn_half_y, "y_max": dyn_half_y,
+                }
+                halss_result = self.halss.evaluate(
+                    halss_points, fixed_bounds=roi_bounds,
+                )
+                if halss_result is None:
+                    sem_map = np.full(
+                        (self.obs_h, self.obs_w), self.danger_id,
+                        dtype=np.uint8,
+                    )
+                else:
+                    bev_data = halss_result.get("bev_data", halss_result)
+                    sem_map = self.sem_gen.generate(bev_data)
+
+                semantic_valid_mask = np.ones_like(sem_map, dtype=bool)
+                if self._projection_mode == "training_camera":
+                    sparse_depth, valid_mask, sem_map, semantic_valid_mask = (
+                        project_training_camera(
+                            projection_points,
+                            sem_map,
+                            roi_bounds,
+                            self._training_camera,
+                            danger_id=self.danger_id,
+                        )
+                    )
+                else:
+                    sparse_depth, _ = project_bev_depth(
+                        halss_points,
+                        grid_res=int(self.cfg["perception"].get("halss_grid_res", 64)),
+                        out_size=self.obs_w,
+                        max_range=self.depth_max,
+                        half_x=dyn_half_x,
+                        half_y=dyn_half_y,
+                    )
+                    valid_mask = (
+                        (sparse_depth < self.depth_max)
+                        & (sparse_depth > 0.01)
+                    )
+
+                rendered_depth = render_sparse_depth(
+                    sparse_depth, valid_mask, self.depth_max,
+                )
+                binary_semantic_vis = make_binary_semantic_vis(
+                    sem_map,
+                    safe_id=self.safe_id,
+                    danger_id=self.danger_id,
+                )
+                binary_semantic_vis[~semantic_valid_mask] = 128
+
+                inference_start = time.perf_counter()
+                action_id, rl_info = self.drl.predict(rendered_depth, sem_map)
+                inference_ms = (time.perf_counter() - inference_start) * 1000.0
+                action_name = self.decomposer.action_id_to_name(action_id)
+                probs = rl_info.get("action_probs") or []
+                top3 = _top_probs(
+                    probs,
+                    action_names=self.decomposer.action_names,
+                )
+                total_ms = (time.perf_counter() - loop_start) * 1000.0
+                confidence = float(rl_info.get("confidence", float("nan")))
+                if total_ms > self.max_inference_result_age_ms:
+                    warn_limited(
+                        "slow_inference",
+                        "[ObserveHover] inference result age %.0fms > %.0fms; "
+                        "result is diagnostic only and hold remains active",
+                        total_ms, self.max_inference_result_age_ms,
+                    )
+
+                print(
+                    f"\r[{self.step_count:05d}] DRL_ONLY="
+                    f"{action_id}({action_name}) conf={confidence:.3f} "
+                    f"{top3} pts={roi_points} sync={sync_ms:.0f}ms "
+                    f"onnx={inference_ms:.0f}ms total={total_ms:.0f}ms "
+                    f"HOLD=({_fmt_vec(target)}) yr={self.yaw_rate_cmd:+.3f}",
+                    end="", flush=True,
+                )
+
+                # Preserve the normal action diagnostics. Candidate velocities
+                # are recorded as policy output only; actual MAVROS velocity is
+                # explicitly zero because the command is a position hold.
+                execution_yaw = float(frame_pose[5])
+                v_body, v_ned, _ = self.decomposer.decompose(
+                    action_id, execution_yaw,
+                )
+                self._log_drl_action(
+                    step=self.step_count,
+                    cloud_seq=cloud_seq,
+                    pose_seq=pose_seq,
+                    sync_ms=sync_ms,
+                    pose_xyz=control_pose[:3],
+                    yaw_rad=execution_yaw,
+                    roi_points=roi_points,
+                    roi_z_min=float(halss_stats.get("z_min_body", float("nan"))),
+                    roi_z_max=float(halss_stats.get("z_max_body", float("nan"))),
+                    depth_min=float(np.min(rendered_depth)),
+                    depth_mean=float(np.mean(rendered_depth)),
+                    depth_max=float(np.max(rendered_depth)),
+                    sem_safe_ratio=float(np.mean(sem_map == self.safe_id)),
+                    sem_danger_ratio=float(np.mean(sem_map == self.danger_id)),
+                    action_id=action_id,
+                    action_name=action_name,
+                    action_probs=probs,
+                    v_body=v_body,
+                    v_ned=v_ned,
+                    v_mavros_sp=np.zeros(3, dtype=np.float32),
+                )
+                self.visualizer.update(
+                    sem_map=sem_map,
+                    depth_map=rendered_depth,
+                    binary_semantic_vis=binary_semantic_vis,
+                )
+                self.step_count += 1
+            except Exception as exc:
+                warn_limited(
+                    "inference_error",
+                    "[ObserveHover] Perception/inference error: %s; holding position",
+                    exc,
+                )
+
+            await asyncio.sleep(
+                max(0.0, self.sim_dt - (time.perf_counter() - loop_start))
+            )
+
+    async def _shutdown(self):
+        """Close observation resources without emitting a final velocity command."""
+        logger.info("[ObserveHover] Shutting down without flight-mode/disarm commands")
+        if self.fc is not None:
+            try:
+                self.fc.stop_hold_stream()
+                await self.fc.close()
+            except Exception as exc:
+                logger.warning("[ObserveHover] Controller close failed: %s", exc)
+        self.visualizer.close()
+        await self._stop_recording()
+        self._close_velocity_log()
+        self._close_drl_action_log()
+        self._close_experiment_logs()
+        if self._rospy is not None:
+            self._rospy.signal_shutdown("indoor observation hover stopped")
+        logger.info("[ObserveHover] Shutdown complete")
+
+
+def main():
+    args = _parse_args()
+    overrides = {}
+    if args.yaw_rate_rad_s is not None:
+        overrides.setdefault("uav", {})["yaw_rate_rad_s"] = float(
+            args.yaw_rate_rad_s
+        )
+    if args.dmax is not None:
+        overrides.setdefault("depth_projection", {})["max_range"] = float(args.dmax)
+    vis_overrides = overrides.setdefault("visualization", {})
+    if args.no_display:
+        vis_overrides["enable"] = False
+    if args.save_frames:
+        vis_overrides["save_frames"] = True
+    if args.save_dir:
+        vis_overrides["save_dir"] = args.save_dir
+    if not vis_overrides:
+        overrides.pop("visualization", None)
+
+    cfg_mode = str(CFG.get("localization", {}).get("mode", "")).lower()
+    prior_mode = str(CFG.get("global_prior", {}).get("mode", "")).lower()
+    if cfg_mode != "fastlio_external_vision" or prior_mode != "local_body_offset":
+        raise SystemExit(
+            "test_live_nocontrol.py only accepts the indoor "
+            "fastlio_external_vision + local_body_offset profile"
+        )
+
+    pipeline = IndoorObservationPipeline(
+        args.config,
+        config_overrides=overrides,
+        onnx_model_path=args.onnx_model,
+    )
+    if not args.allow_incomplete_experiment:
+        pipeline.enforce_flight_ready()
+    else:
+        logger.warning("[FlightReady] Strict gates bypassed for bench debugging")
+
+    record_cfg = pipeline.cfg.get("experiment_recording", {})
+    if args.record_bag:
+        pipeline.enable_recording(True)
+    elif args.no_record_bag:
+        pipeline.enable_recording(False)
+    elif record_cfg.get("enabled", False):
+        pipeline.enable_recording(True)
+
+    logger.warning(
+        "This mode controls takeoff/position/yaw only; DRL actions are observation-only. "
+        "Exit OFFBOARD manually to take over."
+    )
+    if not pipeline.init_ros_node(node_name="orin_indoor_observation_hover"):
+        raise SystemExit(1)
+    asyncio.run(pipeline.run())
 
 
 if __name__ == "__main__":

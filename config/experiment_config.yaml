@@ -9,6 +9,9 @@
 # ---- 运行时 ----
 runtime:
   use_gpu: true                    # 强制 GPU (ARM64 CPU 有 Conv2d NaN bug)
+  enable_detailed_profiling: true  # 逐帧细分耗时/质量/异常字段；false时保持旧frame_timing表头
+  cold_warmup_timeout_s: 15        # CUDA/HALSS/ONNX 冷启动阶段独立超时
+  fresh_validation_timeout_s: 10   # 冷启动完成后等待一帧新鲜有效数据的独立超时
   max_inference_result_age_ms: 500 # 点云header年龄+计算耗时小于此值即可执行，不要求绝对最新帧
   max_cloud_odom_sync_ms: 100      # FAST-LIO 点云/位姿 header 最大允许时间差
   drop_stale_frames: true          # 只丢弃超过 max_inference_result_age_ms 的结果
@@ -43,8 +46,8 @@ observation:
 # ---- 无人机参数 ----
 uav:
   vel_lateral: 1.0                 # 与 DRL 训练环境一致: 水平速度 (m/s)
-  vel_vertical: 10.0              # 与当前 PPO2 训练动作一致；DIRECT_LAND仍独立限速0.25m/s
-  # 全局唯一偏航率配置入口。正式室外从0开始，按0→0.3→0.5→1.0rad/s分级验证。
+  vel_vertical: 2.0              # 与当前 PPO2 训练动作一致；DIRECT_LAND仍独立限速0.25m/s
+  # 全局唯一偏航率配置入口；软件不限制数值范围。
   yaw_rate_rad_s: 5.0              # 偏航转速 (rad/s, 0=不旋转)
   action_frame: "body"             # DRL 横移坐标系: "body" 机体系 / "ned"
   execution_yaw_source: "px4_ekf"  # body动作转世界速度使用PX4 yaw，避免假设FAST-LIO world=地理NED
@@ -105,7 +108,6 @@ fastlio_health:
   max_cloud_odom_sync_ms: 100       # 点云-位姿最大时间同步偏移
   min_cloud_points: 50              # 点云最少点数
   pose_jump_threshold_m: 1.0        # 位姿跳变阈值 (米)
-  yaw_jump_threshold_deg: 20.0      # yaw 跳变阈值 (度)
   degraded_control_action: "direct_land"       # FAST-LIO pose 退化时使用 MAVROS ENU 锁 XY 降落
   degraded_cloud_action: "direct_land"         # cloud 退化时的安全动作 ("direct_land" | "abort")
 

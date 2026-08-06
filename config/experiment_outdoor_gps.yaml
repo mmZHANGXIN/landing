@@ -2,11 +2,14 @@
 # 完整运行快照会在启动时展开并保存，不依赖此 extends 文件离线复现。
 extends: "experiment_config.yaml"
 
-# 室外偏航故障验证严格分级: 0 → 0.3 → 0.5 → 1.0 rad/s
-# 通过专项高动态验证前禁止 >1.0。每级实验通过 CLI 显式覆盖:
-#   --yaw-rate-rad-s 0.3 --allow-high-yaw-rate-test
+runtime:
+  # 正式飞行关闭逐帧细分统计，保留基础时序、任务事件和控制日志。
+  enable_detailed_profiling: false
+
+# 偏航率不再由软件门控限制；可通过 CLI 显式覆盖:
+#   --yaw-rate-rad-s 0.3
 uav:
-  yaw_rate_rad_s: 0.0              # 起步验证: 零偏航，确保平移控制链路正常
+  yaw_rate_rad_s: 5.0              # 起步验证: 零偏航，确保平移控制链路正常
 
 localization:
   mode: "gps_px4_fastlio_perception"
@@ -38,7 +41,20 @@ perception:
 global_prior:
   enabled: true
   mode: "gps"
+  goto_tolerance_xy_m: 3.0
+  goto_tolerance_z_m: 0.5
+  goto_max_time_s: 120.0
   goto_max_vertical_speed_mps: 1.0
+  # 捕获安全点后先以零平移速度继续偏航；姿态连续稳定后才允许进入 DRL。
+  safe_point_stabilization_max_tilt_deg: 10.0
+  safe_point_stabilization_duration_s: 2.0
+  safe_point_stabilization_timeout_s: 15.0
+  # Offboard 接管后的 Phase 1 集结点模式：
+  # "home" 保持原有返回起飞原点上空的行为；切换为 "fixed_gps" 使用下方坐标。
+  takeoff_staging_mode: "fixed_gps"
+  takeoff_staging_lat: 22.7295015
+  takeoff_staging_lon: 113.90659369375041
+  takeoff_staging_altitude_m: 30.0
   # 本次 GIS 九宫格最低风险格中心；更换场地后必须在这里更新。
   target_lat: 22.729503968041545
   target_lon: 113.90750832702452

@@ -75,7 +75,6 @@ class PoseSourceManager:
       max_cloud_odom_sync_ms: 100
       min_cloud_points: 50
       pose_jump_threshold_m: 1.0
-      yaw_jump_threshold_deg: 20.0
       degraded_control_action: "use_gps_fallback"
       degraded_cloud_action: "direct_land"
 
@@ -95,7 +94,6 @@ class PoseSourceManager:
         self.max_cloud_odom_sync_ms = float(health_cfg.get("max_cloud_odom_sync_ms", 100))
         self.min_cloud_points = int(health_cfg.get("min_cloud_points", 50))
         self.pose_jump_threshold_m = float(health_cfg.get("pose_jump_threshold_m", 1.0))
-        self.yaw_jump_threshold_deg = float(health_cfg.get("yaw_jump_threshold_deg", 20.0))
 
         degraded_ctrl = str(health_cfg.get("degraded_control_action", "use_gps_fallback")).lower()
         try:
@@ -127,7 +125,6 @@ class PoseSourceManager:
         self._last_yaw: Optional[float] = None
         self._last_pose_time: Optional[float] = None
         self._pose_jump_triggered: bool = False
-        self._yaw_jump_triggered: bool = False
 
         # 当前报告
         self._current_report = PoseHealthReport(
@@ -139,9 +136,9 @@ class PoseSourceManager:
 
         logger.info(
             "[PoseSrc] Init: pose_max_age=%.0fms cloud_max_age=%.0fms sync_max=%.0fms "
-            "min_pts=%d pose_jump=%.1fm yaw_jump=%.1fdeg",
+            "min_pts=%d pose_jump=%.1fm",
             self.max_pose_age_ms, self.max_cloud_age_ms, self.max_cloud_odom_sync_ms,
-            self.min_cloud_points, self.pose_jump_threshold_m, self.yaw_jump_threshold_deg,
+            self.min_cloud_points, self.pose_jump_threshold_m,
         )
         logger.info(
             "[PoseSrc] GPS fallback: allow=%s only_when_degraded=%s",
@@ -214,11 +211,8 @@ class PoseSourceManager:
             if self._last_yaw is not None:
                 yaw_diff = abs(self._wrap_pi(yaw - self._last_yaw))
                 yaw_jump_deg = math.degrees(yaw_diff)
-                if yaw_jump_deg > self.yaw_jump_threshold_deg:
-                    pose_healthy = False
-                    self._yaw_jump_triggered = True
-                else:
-                    self._yaw_jump_triggered = False
+                # Diagnostic only. Commanded yaw rate is unrestricted, so a
+                # large inter-frame yaw delta must not change flight state.
 
             self._last_pose = pose_xyz.copy()
             self._last_yaw = yaw
@@ -256,7 +250,7 @@ class PoseSourceManager:
 
         if not pose_healthy:
             degraded_reason = self._build_pose_degraded_reason(
-                pose_age_ms, pose_jump_m, yaw_jump_deg
+                pose_age_ms, pose_jump_m
             )
             if not cloud_healthy:
                 # 双退化 → 按 cloud 退化动作
@@ -330,15 +324,12 @@ class PoseSourceManager:
         self,
         pose_age_ms: Optional[float],
         pose_jump_m: Optional[float],
-        yaw_jump_deg: Optional[float],
     ) -> str:
         parts = []
         if pose_age_ms is not None and pose_age_ms > self.max_pose_age_ms:
             parts.append(f"pose_age={pose_age_ms:.0f}ms > {self.max_pose_age_ms:.0f}ms")
         if pose_jump_m is not None and pose_jump_m > self.pose_jump_threshold_m:
             parts.append(f"pose_jump={pose_jump_m:.2f}m > {self.pose_jump_threshold_m:.2f}m")
-        if yaw_jump_deg is not None and yaw_jump_deg > self.yaw_jump_threshold_deg:
-            parts.append(f"yaw_jump={yaw_jump_deg:.1f}deg > {self.yaw_jump_threshold_deg:.1f}deg")
         if not parts:
             parts.append("pose_unavailable")
         return "; ".join(parts)

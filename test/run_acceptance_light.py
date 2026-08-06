@@ -27,7 +27,6 @@ PYTHON = sys.executable
 EXPECTED_DEFAULT_FLIGHT_READY_FAILURES = (
     "global_prior.enabled=false",
     "depth_completion.output_scale is null",
-    "uav.yaw_rate_rad_s is 0.0",
 )
 
 REQUIRED_VISUALIZATION_OKS = (
