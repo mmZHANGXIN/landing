@@ -69,9 +69,7 @@ catkin_make
 - `uav.yaw_rate_rad_s` 
 - `uav.action_lateral_sign`
 
-### Step 6
-
-#### 6b
+### Step 5
 
 ```bash
 roscore &
