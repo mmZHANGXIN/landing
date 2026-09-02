@@ -9,7 +9,7 @@ Jetson Orin NX 16GB | ARM64, CUDA Cores + Tensor Cores |
 Ubuntu 20.04 + JetPack 5.x | CUDA 11.4, cuDNN 8.5, TensorRT 8.5 |
 | ROS | **Noetic** (ROS1) | FAST-LIO + livox_ros_driver2 |
 | Python 3.8 |
-| PyTorch | 2.1+ (Jetson版) | NVIDIA Jetson wheel |
+| PyTorch | 2.1+ (Jetson) | NVIDIA Jetson wheel |
 | OpenCV | 4.5+ |
 | ONNX Runtime | 1.17+ |
 
