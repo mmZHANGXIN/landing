@@ -1,6 +1,6 @@
 # Landing
 
-> Jetson Orin NX 16GB + Mid360 LiDAR + FAST-LIO + HALSS + ONNX DRL (ROS1 Noetic)
+> Jetson Orin NX 16GB + Mid360 LiDAR
 
 
 ## Dependencies
@@ -64,15 +64,6 @@ catkin_make
 ```
 
 ### Step 4
-
-```bash
-# numpy, opencv-python, pyyaml, matplotlib, onnxruntime, scipy
-# ROS1 Python: rospkg, pycryptodomex
-PYTHON=/home/ifsc_orin/miniconda3/envs/fylanding/bin/python
-$PYTHON -c "import rospy, numpy, cv2, yaml, onnxruntime; print('OK')"
-```
-
-### Step 5
 
 `config/experiment_config.yaml`:
 - `uav.yaw_rate_rad_s` 
