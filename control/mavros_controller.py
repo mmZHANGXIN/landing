@@ -672,8 +672,26 @@ class MAVROSController:
                     "armed=%s offboard=%s mode=%s elapsed=%.1fs",
                     self.isArmed, self.isOffboard, self.flightMode, elapsed,
                 )
+                # Discard preparation history before the stability window so
+                # any transition during the window is latched as a new event.
+                self.clear_safety_fallback()
                 # 预热: 等待 OFFBOARD 稳定
                 await asyncio.sleep(self._offboard_warmup_s)
+                if not (self.isArmed and self.isOffboard) or self.safety_fallback:
+                    logger.warning(
+                        "[MAVROS] OFFBOARD/arm changed during %.1fs stabilization; "
+                        "continuing to wait (armed=%s offboard=%s mode=%s fallback=%s)",
+                        self._offboard_warmup_s,
+                        self.isArmed,
+                        self.isOffboard,
+                        self.flightMode,
+                        self.safety_fallback_reason or "none",
+                    )
+                    continue
+                # Everything before this stable handoff is preparation history.
+                # Clear it exactly here so a later transition is unambiguously
+                # a new in-flight safety event.
+                self.clear_safety_fallback()
                 # Atomically hand off from the ground-safe hold before
                 # disabling hold_stream. Callers choose fixed yaw or yaw-rate.
                 with self._lock:
@@ -726,8 +744,9 @@ class MAVROSController:
 
     def clear_safety_fallback(self):
         """清除安全 fallback 标志 (例如切换到 HOLD 后)."""
-        self._safety_fallback = False
-        self._safety_fallback_reason = ""
+        with self._lock:
+            self._safety_fallback = False
+            self._safety_fallback_reason = ""
 
     # ------------------------------------------------------------------
     # 服务调用

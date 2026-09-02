@@ -20,8 +20,11 @@ import argparse
 import asyncio
 import logging
 import math
+import multiprocessing
 import os
+import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -44,12 +47,12 @@ def _import_runtime_deps():
     global np, cv2, ort
     global MAVROSController, PoseSourceManager, ned_to_enu_velocity
     global ActionDecomposer, ActionCollapseMonitor
-    global FastLIOInterface, HALSSBayesianEvaluator, world_to_level_body_roi
+    global FastLIOInterface, world_to_level_body_roi
     global body_cloud_to_level_body_roi
     global TrainingCameraModel, project_training_camera
     global sample_nearest_points_by_camera_rays
     global MissionStateManager, StateInputs
-    global SemanticGenerator, GlobalSafetyPrior
+    global GlobalSafetyPrior
     global RealtimeVisualizer, _RUNTIME_DEPS_READY
     global MissionState
 
@@ -64,7 +67,6 @@ def _import_runtime_deps():
     from control.action_decomposer import ActionDecomposer as _ActionDecomposer
     from diagnostics.action_monitor import ActionCollapseMonitor as _ActionCollapseMonitor
     from odometry import FastLIOInterface as _FastLIOInterface
-    from perception.halss_bayesian import HALSSBayesianEvaluator as _HALSSBayesianEvaluator
     from perception.halss_preprocess import (
         world_to_level_body_roi as _world_to_level_body_roi,
         body_cloud_to_level_body_roi as _body_cloud_to_level_body_roi,
@@ -77,7 +79,6 @@ def _import_runtime_deps():
     from control.mission_state_manager import MissionStateManager as _MissionStateManager
     from control.mission_state_manager import StateInputs as _StateInputs
     from control.mission_state_manager import MissionState as _MissionState
-    from perception.semantic_generator import SemanticGenerator as _SemanticGenerator
     from preprocessing.global_safety_prior import GlobalSafetyPrior as _GlobalSafetyPrior
     from visualization import RealtimeVisualizer as _RealtimeVisualizer
 
@@ -90,7 +91,6 @@ def _import_runtime_deps():
     ActionDecomposer = _ActionDecomposer
     ActionCollapseMonitor = _ActionCollapseMonitor
     FastLIOInterface = _FastLIOInterface
-    HALSSBayesianEvaluator = _HALSSBayesianEvaluator
     world_to_level_body_roi = _world_to_level_body_roi
     body_cloud_to_level_body_roi = _body_cloud_to_level_body_roi
     TrainingCameraModel = _TrainingCameraModel
@@ -99,7 +99,6 @@ def _import_runtime_deps():
     MissionStateManager = _MissionStateManager
     StateInputs = _StateInputs
     MissionState = _MissionState
-    SemanticGenerator = _SemanticGenerator
     GlobalSafetyPrior = _GlobalSafetyPrior
     RealtimeVisualizer = _RealtimeVisualizer
     _RUNTIME_DEPS_READY = True
@@ -280,13 +279,50 @@ class ONNXDRL:
     def __init__(self, onnx_path: str, obs_h: int = 128, obs_w: int = 128,
                  dmax: float = 30.0,
                  depth_norm_mode: str = "raw_meters_graph_scaled",
-                 semantic_norm_mode: str = "raw_gray_graph_scaled"):
+                 semantic_norm_mode: str = "raw_gray_graph_scaled",
+                 require_gpu: bool = True,
+                 allow_cpu_fallback_if_no_gpu_ep: bool = False):
         if not Path(onnx_path).is_file():
             raise FileNotFoundError(f"ONNX model not found: {onnx_path}")
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 1
         opts.inter_op_num_threads = 1
-        self.session = ort.InferenceSession(onnx_path, opts)
+        available = set(ort.get_available_providers())
+        # HALSS/PyTorch remains strictly CUDA-only.  The deployed Jetson ORT
+        # build may expose only CPUExecutionProvider; the policy has measured
+        # at ~4 ms on that provider and is still protected by the 500 ms result
+        # age gate.  Prefer GPU EPs when the installed ORT build provides them,
+        # but preserve the pre-worker CPU fallback behavior otherwise.
+        providers = [
+            provider
+            for provider in (
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            )
+            if provider in available
+        ]
+        if not providers:
+            raise RuntimeError(
+                f"ONNX Runtime exposes no supported execution provider: {sorted(available)}"
+            )
+        gpu_provider_available = any(
+            provider in available
+            for provider in ("TensorrtExecutionProvider", "CUDAExecutionProvider")
+        )
+        if require_gpu and not gpu_provider_available and not allow_cpu_fallback_if_no_gpu_ep:
+            raise RuntimeError(
+                "ONNX GPU execution provider is unavailable and explicit CPU "
+                "fallback is disabled"
+            )
+        if require_gpu and not gpu_provider_available:
+            logger.warning(
+                "[ONNX] GPU execution provider unavailable; explicit CPU fallback "
+                "enabled with runtime result-age enforcement. available=%s",
+                sorted(available),
+            )
+        self.session = ort.InferenceSession(onnx_path, opts, providers=providers)
+        self.active_providers = self.session.get_providers()
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
         in_shape = self.session.get_inputs()[0].shape
@@ -311,8 +347,10 @@ class ONNXDRL:
         self._forward(dummy)
         logger.info(
             "[ONNX] model=%s input=%s shape=%s layout=%s "
-            "external_encoding=(raw_depth_m,raw_gray), graph_scale=/255 warmup=OK",
+            "providers=%s external_encoding=(raw_depth_m,raw_gray), "
+            "graph_scale=/255 warmup=OK",
             onnx_path, self.input_name, in_shape, self.layout,
+            self.active_providers,
         )
 
     def _forward(self, obs_raw):
@@ -543,7 +581,8 @@ class OrinLandingPipeline:
         perc_cfg = self.cfg["perception"]
         depth_cfg = self.cfg["depth_projection"]
         uav_cfg = self.cfg["uav"]
-        drl_cfg = self.cfg.get("decision", {})
+        dec_cfg = self.cfg.get("decision", {})
+        self._drl_require_gpu=bool(dec_cfg.get("require_gpu", True))
 
         self.depth_max = float(depth_cfg.get("max_range", 30.0))
         self.obs_h = int(obs_cfg.get("img_height", 128))
@@ -574,10 +613,15 @@ class OrinLandingPipeline:
         self.fresh_validation_timeout_s = float(
             runtime_cfg.get("fresh_validation_timeout_s", 10.0)
         )
+        self.perception_worker_init_timeout_s = float(
+            runtime_cfg.get("perception_worker_init_timeout_s", 60.0)
+        )
         if self.cold_warmup_timeout_s <= 0.0:
             raise ValueError("runtime.cold_warmup_timeout_s must be > 0")
         if self.fresh_validation_timeout_s <= 0.0:
             raise ValueError("runtime.fresh_validation_timeout_s must be > 0")
+        if self.perception_worker_init_timeout_s <= 0.0:
+            raise ValueError("runtime.perception_worker_init_timeout_s must be > 0")
         self.max_cloud_odom_sync_ms = float(runtime_cfg.get("max_cloud_odom_sync_ms", 100.0))
         localization_cfg = self.cfg.get("localization", {})
         self.localization_mode = str(
@@ -618,28 +662,13 @@ class OrinLandingPipeline:
         logger.info(" Initializing Orin Landing Pipeline...")
         logger.info("=" * 60)
 
-        logger.info("[Init] HALSS Bayesian evaluator...")
-        self.halss = HALSSBayesianEvaluator(perc_cfg)
-
-        logger.info("[Init] Semantic generator...")
-        self.sem_gen = SemanticGenerator(
-            {**perc_cfg, "img_width": self.obs_w, "img_height": self.obs_h}
-        )
-
         self.onnx_model_path = (
             onnx_model_path
-            or drl_cfg.get("onnx_model_path")
+            or dec_cfg.get("onnx_model_path")
             or "weights/ppo2_policy.onnx"
         )
-        logger.info("[Init] ONNX DRL policy...")
-        self.drl = ONNXDRL(
-            self.onnx_model_path,
-            obs_h=self.obs_h,
-            obs_w=self.obs_w,
-            dmax=self.depth_max,
-            depth_norm_mode=str(obs_cfg.get("depth_norm_mode", "raw_meters_graph_scaled")),
-            semantic_norm_mode=str(obs_cfg.get("semantic_norm_mode", "raw_gray_graph_scaled")),
-        )
+        # HALSS, semantic generation and ONNX are intentionally constructed in
+        # a spawn child.  The flight/control process must never own CUDA state.
         logger.info(
             "[Init] Perception route: HALSS + training-camera NN-fill depth + ONNX DRL "
             "(dmax=%.1fm, obs=%dx%d)",
@@ -692,8 +721,32 @@ class OrinLandingPipeline:
         self._home_ned = np.zeros(3, dtype=np.float32)
         self._home_lat = None
         self._home_lon = None
+        self._gps_reference_ned = None
         self._direct_land_enu_xy = None
         self._horizontal_hold_enu_xy = None
+        self._perception_hold_enu_xyz = None
+        self._perception_failure_since = None
+        self._last_valid_perception_perf = None
+        self._perception_worker_generation = 0
+        self._perception_worker = None
+        self._perception_request_queue = None
+        self._perception_result_queue = None
+        self._perception_status_queue = None
+        self._perception_worker_ready = False
+        self._perception_active_seq = None
+        self._perception_active_since = None
+        self._last_worker_rejection_reason = ""
+        self._shutdown_reason = ""
+        self._shutdown_event_logged = False
+        self._perception_worker_hard_timeout_s = float(
+            runtime_cfg.get("perception_worker_hard_timeout_s", 1.0)
+        )
+        if self._perception_worker_hard_timeout_s * 1000.0 <= self.max_inference_result_age_ms:
+            raise ValueError(
+                "runtime.perception_worker_hard_timeout_s must exceed "
+                "runtime.max_inference_result_age_ms"
+            )
+        self._perception_stage_log_path = None
         self._goto_tolerance_xy = float(self.cfg.get("global_prior", {}).get("goto_tolerance_xy_m", 0.2))
         self._goto_tolerance_z = float(self.cfg.get("global_prior", {}).get("goto_tolerance_z_m", 0.15))
         self._goto_max_time_s = float(self.cfg.get("global_prior", {}).get("goto_max_time_s", 30.0))
@@ -795,6 +848,8 @@ class OrinLandingPipeline:
         ).lower()
         mission_cfg.setdefault("max_cloud_odom_sync_ms", self.max_cloud_odom_sync_ms)
         self.state_manager = MissionStateManager(mission_cfg)
+        if self.state_manager.perception_timeout_s <= 0.0:
+            raise ValueError("mission_state.perception_timeout_s must be > 0")
         self.mission_state = self.state_manager.state.value
 
         self._timing = {"halss": [], "depth": [], "completion": [], "rl": [], "control": [], "total": []}
@@ -869,6 +924,10 @@ class OrinLandingPipeline:
         self._perception_gate_path = None
         self._perception_gate_file = None
         self._perception_gate_writer = None
+        self._diagnostic_log_queue = None
+        self._diagnostic_log_thread = None
+        self._diagnostic_log_running = False
+        self._diagnostic_log_dropped = 0
 
         # --- rosbag recording ---
         self._record_bag = False
@@ -1007,7 +1066,7 @@ class OrinLandingPipeline:
             return False
 
     async def _verify_localization_profile_online(self) -> None:
-        """Reject a mismatched FAST-LIO/PX4 localization setup before arming."""
+        """Verify the live localization wiring without requiring pre-arm GPS."""
         if self.localization_mode == "fastlio_external_vision":
             from geometry_msgs.msg import PoseStamped
             try:
@@ -1030,21 +1089,30 @@ class OrinLandingPipeline:
             )
             return
 
-        deadline = time.perf_counter() + 10.0
-        while not getattr(self.fc, "_gps_ready", False) and time.perf_counter() < deadline:
-            await asyncio.sleep(0.05)
-        if not getattr(self.fc, "_gps_ready", False) or not getattr(self.fc, "_enu_ready", False):
-            raise RuntimeError("Outdoor profile requires valid GPS and MAVROS local odometry")
         localization_cfg = self.cfg.get("localization", {})
+        if not getattr(self.fc, "_enu_ready", False):
+            raise RuntimeError("Outdoor profile requires MAVROS local odometry")
+
+        require_prearm_gps = bool(localization_cfg.get("require_gps_before_arm", False))
+        if require_prearm_gps:
+            deadline = time.perf_counter() + 10.0
+            while not getattr(self.fc, "_gps_ready", False) and time.perf_counter() < deadline:
+                await asyncio.sleep(0.05)
         gps_ok, gps_reason = self.fc.gps_health(
             max_age_s=float(localization_cfg.get("max_gps_age_s", 2.0)),
             max_horizontal_accuracy_m=float(
                 localization_cfg.get("max_gps_horizontal_accuracy_m", 5.0)
             ),
         )
-        if not gps_ok:
+        if require_prearm_gps and not gps_ok:
             raise RuntimeError(f"Outdoor PX4 GPS health gate failed: {gps_reason}")
-        if gps_reason == "ok_covariance_unknown":
+        if not gps_ok:
+            logger.warning(
+                "[Localization] Pre-arm GPS gate disabled; continuing with local odom "
+                "while GPS is not ready (%s)",
+                gps_reason,
+            )
+        elif gps_reason == "ok_covariance_unknown":
             logger.warning(
                 "[Localization] GPS fix is valid but NavSatFix covariance is unknown"
             )
@@ -1070,8 +1138,10 @@ class OrinLandingPipeline:
                 "launch FAST-LIO with external_vision:=false"
             )
         logger.info(
-            "[Localization] Outdoor gate passed: GPS/local odom live (%s), vision injection absent",
+            "[Localization] Outdoor pre-arm gate passed: local odom live, "
+            "vision injection absent, GPS=%s required=%s",
             gps_reason,
+            require_prearm_gps,
         )
 
     async def _verify_fastlio_static_initialization(self) -> None:
@@ -1136,7 +1206,327 @@ class OrinLandingPipeline:
     # Main loop
     # ------------------------------------------------------------------
 
+    def _start_perception_worker(self) -> None:
+        """Start a pristine spawn child that exclusively owns model/CUDA state."""
+        from perception.perception_worker import perception_worker_main
+
+        self._stop_perception_worker(graceful=False)
+        self._perception_worker_generation += 1
+        generation = self._perception_worker_generation
+        ctx = multiprocessing.get_context("spawn")
+        self._perception_request_queue = ctx.Queue(maxsize=1)
+        self._perception_result_queue = ctx.Queue(maxsize=2)
+        self._perception_status_queue = ctx.Queue(maxsize=16)
+        self._perception_worker_ready = False
+        self._perception_active_seq = None
+        self._perception_active_since = None
+        self._perception_worker = ctx.Process(
+            target=perception_worker_main,
+            name=f"orin-perception-{generation}",
+            args=(
+                self.cfg,
+                self.onnx_model_path,
+                generation,
+                self._perception_request_queue,
+                self._perception_result_queue,
+                self._perception_status_queue,
+                str(self._perception_stage_log_path),
+            ),
+            daemon=True,
+        )
+        self._perception_worker.start()
+        self._append_perception_stage_event(
+            generation, -1, "SUPERVISOR", "START",
+        )
+        logger.warning(
+            "[PerceptionWorker] Started generation=%d pid=%s",
+            generation, self._perception_worker.pid,
+        )
+
+    def _stop_perception_worker(self, graceful: bool = True) -> None:
+        process = getattr(self, "_perception_worker", None)
+        if process is None:
+            return
+        self._append_perception_stage_event(
+            self._perception_worker_generation,
+            -1,
+            "SUPERVISOR",
+            "STOP_REQUEST" if graceful else "TERMINATE_REQUEST",
+        )
+        if process.is_alive() and graceful:
+            try:
+                self._perception_request_queue.put_nowait(None)
+            except (queue.Full, OSError, ValueError):
+                pass
+            process.join(timeout=1.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=2.0)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(timeout=1.0)
+        for q in (
+            self._perception_request_queue,
+            self._perception_result_queue,
+            self._perception_status_queue,
+        ):
+            if q is not None:
+                try:
+                    q.close()
+                    q.cancel_join_thread()
+                except (OSError, ValueError):
+                    pass
+        self._perception_worker = None
+        self._perception_worker_ready = False
+        self._perception_active_seq = None
+        self._perception_active_since = None
+
+    def _append_perception_stage_event(self, generation: int, cloud_seq: int,
+                                       stage: str, event: str) -> None:
+        path = getattr(self, "_perception_stage_log_path", None)
+        if path is None:
+            return
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (
+                f"monotonic_s={time.perf_counter():.6f} generation={generation} "
+                f"cloud_seq={cloud_seq} stage={stage} event={event}\n"
+            ).encode("utf-8"))
+        finally:
+            os.close(fd)
+
+    def _poll_perception_status(self) -> None:
+        q = self._perception_status_queue
+        if q is None:
+            return
+        while True:
+            try:
+                status = q.get_nowait()
+            except queue.Empty:
+                return
+            if int(status.get("generation", -1)) != self._perception_worker_generation:
+                continue
+            kind = status.get("kind")
+            if kind == "ready":
+                self._perception_worker_ready = True
+                logger.info(
+                    "[PerceptionWorker] Ready generation=%d onnx_providers=%s",
+                    self._perception_worker_generation,
+                    status.get("onnx_providers", []),
+                )
+            elif kind == "started":
+                self._perception_active_seq = int(status["cloud_seq"])
+                self._perception_active_since = float(status["monotonic_s"])
+            elif kind == "fatal":
+                logger.error(
+                    "[PerceptionWorker] Fatal generation=%d: %s: %s\n%s",
+                    self._perception_worker_generation,
+                    status.get("error_type"), status.get("error"),
+                    status.get("traceback", ""),
+                )
+                self._perception_worker_ready = False
+
+    async def _wait_perception_worker_ready(self, timeout_s: float) -> bool:
+        start = time.perf_counter()
+        while time.perf_counter() - start < timeout_s:
+            self._poll_perception_status()
+            if self._perception_worker_ready:
+                return True
+            if self._perception_worker is None or not self._perception_worker.is_alive():
+                # multiprocessing.Queue uses a feeder thread; give a fatal
+                # status emitted immediately before child exit a brief chance
+                # to arrive before reporting the generic initialization error.
+                await asyncio.sleep(0.05)
+                self._poll_perception_status()
+                return False
+            await asyncio.sleep(0.02)
+        process = self._perception_worker
+        logger.error(
+            "[PerceptionWorker] Initialization timeout after %.1fs "
+            "generation=%d pid=%s alive=%s; inspect %s",
+            timeout_s,
+            self._perception_worker_generation,
+            None if process is None else process.pid,
+            False if process is None else process.is_alive(),
+            self._perception_stage_log_path,
+        )
+        return False
+
+    def _submit_perception_job(self, job: dict) -> None:
+        """Replace an unstarted request so the queue always contains the latest frame."""
+        q = self._perception_request_queue
+        if q is None:
+            raise RuntimeError("perception worker queue is unavailable")
+        try:
+            q.put_nowait(job)
+            return
+        except queue.Full:
+            pass
+        deadline = time.perf_counter() + 0.02
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                if time.perf_counter() >= deadline:
+                    logger.warning(
+                        "[PerceptionWorker] Could not replace queued frame with cloud_seq=%s",
+                        job.get("cloud_seq"),
+                    )
+                    return
+                time.sleep(0.001)
+                continue
+            try:
+                q.put_nowait(job)
+                return
+            except queue.Full:
+                if time.perf_counter() >= deadline:
+                    return
+
+    async def _hold_for_perception_failure(self, reason: str, pose_xyz,
+                                           sync_ms=None) -> None:
+        """Capture a full ENU XYZ hold once and retain configured yaw rate."""
+        now = time.perf_counter()
+        if self._perception_failure_since is None:
+            self._perception_failure_since = now
+            self._perception_hold_enu_xyz = np.asarray(
+                self.fc.uavPosENU, dtype=np.float32,
+            ).copy()
+            logger.warning(
+                "[PerceptionHold] Entered reason=%s ENU=%s yaw_rate=%.3f",
+                reason, _fmt_vec(self._perception_hold_enu_xyz), self.yaw_rate_cmd,
+            )
+        hold = self._perception_hold_enu_xyz
+        await self.fc.send_position_enu_yaw_rate(
+            float(hold[0]), float(hold[1]), float(hold[2]), self.yaw_rate_cmd,
+        )
+        await_age = now - self._perception_failure_since
+        if await_age >= self.state_manager.perception_timeout_s:
+            self._apply_state_decision(self.state_manager.reset(
+                MissionState.HOLD_FOR_MANUAL,
+                "perception_invalid_20s",
+            ))
+            self._log_mission_event(
+                "MANUAL_TAKEOVER_REQUESTED",
+                reason=f"perception_invalid_for={await_age:.1f}s;last={reason}",
+            )
+
+    def _clear_perception_failure(self) -> None:
+        if self._perception_failure_since is not None:
+            logger.info(
+                "[PerceptionHold] Recovered after %.2fs",
+                time.perf_counter() - self._perception_failure_since,
+            )
+        self._perception_failure_since = None
+        self._perception_hold_enu_xyz = None
+        self._last_valid_perception_perf = time.perf_counter()
+
+    async def _run_worker_job(self, job: dict, pose_xyz, sync_ms,
+                              cold_warmup: bool = False):
+        """Submit one frame, holding/restarting if the isolated worker stalls."""
+        cloud_seq = int(job["cloud_seq"])
+        self._submit_perception_job(job)
+        submitted = time.perf_counter()
+        while True:
+            self._poll_perception_status()
+            process = self._perception_worker
+            if process is None or not process.is_alive():
+                self._last_worker_rejection_reason = "worker_exited"
+                await self._hold_for_perception_failure(
+                    "worker_exited", pose_xyz, sync_ms,
+                )
+                self._start_perception_worker()
+                return None
+            try:
+                result = self._perception_result_queue.get_nowait()
+            except queue.Empty:
+                result = None
+            if result is not None:
+                if int(result.get("generation", -1)) != self._perception_worker_generation:
+                    continue
+                if int(result.get("cloud_seq", -1)) != cloud_seq:
+                    # Latest-only policy: an older completed result is never used
+                    # for the current control decision.
+                    continue
+                self._perception_active_seq = None
+                self._perception_active_since = None
+                if not result.get("ok", False):
+                    self._last_worker_rejection_reason = (
+                        f"worker_frame_error:{result.get('error_type', 'unknown')}"
+                    )
+                    logger.error(
+                        "[PerceptionWorker] Frame %d failed: %s: %s\n%s",
+                        cloud_seq, result.get("error_type"), result.get("error"),
+                        result.get("traceback", ""),
+                    )
+                    await self._hold_for_perception_failure(
+                        "worker_frame_error", pose_xyz, sync_ms,
+                    )
+                    return None
+                cloud_stamp = result.get("cloud_stamp_ros_s")
+                result_age_ms = (time.perf_counter() - submitted) * 1000.0
+                if cloud_stamp is not None:
+                    result_age_ms = max(
+                        result_age_ms,
+                        (self._ros_time_now_s() - float(cloud_stamp)) * 1000.0,
+                    )
+                result["result_age_ms"] = result_age_ms
+                if (
+                    not cold_warmup
+                    and result_age_ms > self.max_inference_result_age_ms
+                ):
+                    self._last_worker_rejection_reason = "inference_result_too_old"
+                    await self._hold_for_perception_failure(
+                        "inference_result_too_old", pose_xyz, sync_ms,
+                    )
+                    return None
+                if not cold_warmup:
+                    self._clear_perception_failure()
+                self._last_worker_rejection_reason = ""
+                return result
+
+            elapsed = time.perf_counter() - submitted
+            if (
+                not cold_warmup
+                and elapsed * 1000.0 > self.max_inference_result_age_ms
+            ):
+                self._last_worker_rejection_reason = "inference_soft_timeout"
+                await self._hold_for_perception_failure(
+                    "inference_soft_timeout", pose_xyz, sync_ms,
+                )
+                # Do not wait for the native call.  Return control to the sensor
+                # loop so the capacity-one request queue can be replaced by the
+                # newest cloud while the worker finishes (or is later killed).
+                return None
+            active_elapsed = (
+                0.0 if self._perception_active_since is None
+                else time.perf_counter() - self._perception_active_since
+            )
+            hard_limit_s = (
+                self.cold_warmup_timeout_s
+                if cold_warmup else self._perception_worker_hard_timeout_s
+            )
+            if max(elapsed, active_elapsed) > hard_limit_s:
+                self._last_worker_rejection_reason = "worker_hard_timeout"
+                logger.error(
+                    "[PerceptionWorker] Hard timeout generation=%d cloud_seq=%d; restarting",
+                    self._perception_worker_generation, cloud_seq,
+                )
+                if not cold_warmup:
+                    await self._hold_for_perception_failure(
+                        "worker_hard_timeout", pose_xyz, sync_ms,
+                    )
+                self._start_perception_worker()
+                return None
+            await asyncio.sleep(0.005)
+
     async def run(self):
+        self._start_perception_worker()
+        if not await self._wait_perception_worker_ready(
+            self.perception_worker_init_timeout_s
+        ):
+            self._stop_perception_worker(graceful=False)
+            await self._shutdown()
+            raise RuntimeError("Perception worker failed to initialize")
         self.fc = MAVROSController(
             mavros_ns=self._mavros_ns,
             setpoint_rate_hz=self._setpoint_rate_hz,
@@ -1172,9 +1562,17 @@ class OrinLandingPipeline:
         self._home_enu = self.fc.uavPosENU.copy()
         self._pre_goto_yaw_enu_deg = math.degrees(float(self.fc.uavYawENU))
         self._launch_attitude_ned = launch_attitude.copy()
-        if self._use_global_guidance and not self._indoor_local_mode:
-            _, launch_lat_lon, _ = await self.fc.wait_for_home(timeout_s=10.0)
-            self._home_lat, self._home_lon = launch_lat_lon
+        # GPS is deliberately not a preparation/arming gate.  If a valid fix
+        # already exists, preserve the ground-time horizontal reference.  If
+        # not, it will be paired with the current local NED pose after the
+        # pilot's OFFBOARD/takeoff handoff, before any fixed-GPS target is used.
+        if (
+            self._use_global_guidance
+            and not self._indoor_local_mode
+            and getattr(self.fc, "_gps_ready", False)
+        ):
+            self._home_lat, self._home_lon = tuple(self.fc.uavLatLon)
+            self._gps_reference_ned = launch_ned.copy()
         if self._px4_pose_authoritative:
             self._ground_z_world = float(self._home_enu[2])
             self.state_manager.ground_z_ref_m = self._ground_z_world
@@ -1220,6 +1618,48 @@ class OrinLandingPipeline:
             _fmt_vec(self._home_enu),
             self._ground_z_world,
         )
+
+        if (
+            self._use_global_guidance
+            and not self._indoor_local_mode
+            and (self._home_lat is None or self._home_lon is None)
+        ):
+            logger.warning(
+                "[Localization] GPS was unavailable during preparation; waiting after "
+                "OFFBOARD/takeoff handoff before converting fixed GPS targets"
+            )
+            try:
+                gps_reference_ned, guidance_lat_lon, _ = await self.fc.wait_for_home(timeout_s=10.0)
+            except TimeoutError as exc:
+                hold_xyz = np.asarray(self.fc.uavPosENU, dtype=np.float32).copy()
+                logger.error(
+                    "[Localization] GPS still unavailable after takeoff handoff; "
+                    "holding for manual takeover: %s",
+                    exc,
+                )
+                self._apply_state_decision(self.state_manager.reset(
+                    MissionState.HOLD_FOR_MANUAL,
+                    "post_takeoff_gps_unavailable",
+                ))
+                self._log_mission_event(
+                    "MANUAL_TAKEOVER_REQUESTED",
+                    reason="post_takeoff_gps_unavailable",
+                )
+                await self._hold_for_manual_takeover(
+                    hold_xyz=hold_xyz,
+                    yaw_rate_rad_s=self.yaw_rate_cmd,
+                )
+                await self._shutdown()
+                return
+            self._home_lat, self._home_lon = guidance_lat_lon
+            self._gps_reference_ned = gps_reference_ned.copy()
+            logger.info(
+                "[Localization] Post-takeoff GPS reference acquired: lat=%.7f "
+                "lon=%.7f local_ned=%s",
+                self._home_lat,
+                self._home_lon,
+                _fmt_vec(self._gps_reference_ned),
+            )
 
         if self._indoor_local_mode:
             self._safe_ned_target = self._compute_local_ned_target_3d(
@@ -1290,7 +1730,7 @@ class OrinLandingPipeline:
             dist_z = abs(self._safe_ned[2] - self._home_ned[2])
             if dist_xy <= 1e-3 and dist_z <= 0.5:
                 raise RuntimeError(
-                    "[GlobalPrior] Safe point too close to home; "
+                    "[GlobalPrior] Safe point converts to near-zero NED offset; "
                     "home GPS may be unavailable or target equals takeoff position."
                 )
             self._apply_state_decision(self.state_manager.start_after_takeoff(True))
@@ -1317,7 +1757,7 @@ class OrinLandingPipeline:
                     "HIGH_ALTITUDE_REACHED",
                     reason=f"target_altitude_m={self._takeoff_altitude_m:.3f}",
                 )
-            else:
+            elif self.mission_state not in ("ABORT", "IDLE", "LANDED"):
                 logger.warning(
                     "[MissionEvent] HIGH_ALTITUDE_REACHED not recorded: target tolerance not met"
                 )
@@ -1341,7 +1781,7 @@ class OrinLandingPipeline:
             await self._hold_for_manual_takeover()
             await self._shutdown()
             return
-        if self.mission_state in ("ABORT", "IDLE"):
+        if self.mission_state in ("ABORT", "IDLE", "LANDED"):
             await self._shutdown()
             return
 
@@ -1357,7 +1797,10 @@ class OrinLandingPipeline:
                 "MANUAL_TAKEOVER_REQUESTED",
                 reason="perception_warmup_failed",
             )
-            await self._hold_for_manual_takeover()
+            await self._hold_for_manual_takeover(
+                hold_xyz=self._perception_hold_enu_xyz,
+                yaw_rate_rad_s=self.yaw_rate_cmd,
+            )
             await self._shutdown()
             return
         print(
@@ -1416,19 +1859,57 @@ class OrinLandingPipeline:
                         f"{stamp_now:.3f}" if stamp_now is not None else "None",
                     )
 
-                # Flight-controller state is authoritative and must be checked
-                # before waiting on perception.  Leaving OFFBOARD is an
-                # intentional manual takeover, not an autonomous emergency.
-                if self.fc is not None and getattr(self.fc, "isOffboard", None) is False:
-                    logger.warning("[Pipeline] OFFBOARD exited; yielding to manual control")
-                    self._log_mission_event("MANUAL_TAKEOVER", reason="offboard_exited")
-                    self.mission_state = "IDLE"
+                # Check both current MAVROS state and the latched transition.
+                # The latch catches brief losses between two loop iterations.
+                if not await self._check_active_flight_safety("DRL_DESCENT"):
                     break
-                if self.fc is not None and getattr(self.fc, "isArmed", None) is False:
-                    logger.info("[Pipeline] Vehicle disarmed; ending control loop")
-                    self._log_mission_event("DISARMED", reason="px4_disarmed")
-                    self.mission_state = "LANDED"
-                    break
+
+                # Perception supervision must not depend on a new cloud.  A
+                # native worker can hang at the same time the sensor stream
+                # stalls, and the full-position hold/20 s takeover deadline
+                # still has to progress.
+                self._poll_perception_status()
+                if (
+                    self.mission_state == "DRL_DESCENT"
+                    and self._perception_active_since is not None
+                    and time.perf_counter() - self._perception_active_since
+                    > self._perception_worker_hard_timeout_s
+                ):
+                    logger.error(
+                        "[PerceptionWorker] Supervisor hard timeout generation=%d "
+                        "cloud_seq=%s; restarting",
+                        self._perception_worker_generation,
+                        self._perception_active_seq,
+                    )
+                    self._last_worker_rejection_reason = "worker_hard_timeout"
+                    await self._hold_for_perception_failure(
+                        "worker_hard_timeout", None, None,
+                    )
+                    self._start_perception_worker()
+                if (
+                    self._perception_failure_since is not None
+                    and self.mission_state != "DIRECT_LAND"
+                ):
+                    last_valid = (
+                        self._last_valid_perception_perf
+                        if self._last_valid_perception_perf is not None
+                        else self._perception_failure_since
+                    )
+                    invalid_age = time.perf_counter() - last_valid
+                    if invalid_age >= self.state_manager.perception_timeout_s:
+                        self._apply_state_decision(self.state_manager.reset(
+                            MissionState.HOLD_FOR_MANUAL,
+                            "perception_invalid_20s",
+                        ))
+                        self._log_mission_event(
+                            "MANUAL_TAKEOVER_REQUESTED",
+                            reason=f"perception_invalid_for={invalid_age:.1f}s",
+                        )
+                        await self._hold_for_manual_takeover(
+                            hold_xyz=self._perception_hold_enu_xyz,
+                            yaw_rate_rad_s=self.yaw_rate_cmd,
+                        )
+                        break
 
                 (
                     frame_points,
@@ -1701,6 +2182,11 @@ class OrinLandingPipeline:
                         np.zeros(3),
                     )[:3]),
                     cloud_odom_sync_ms=sync_ms,
+                    perception_age_s=(
+                        None
+                        if self._last_valid_perception_perf is None
+                        else max(0.0, loop_start - self._last_valid_perception_perf)
+                    ),
                     perception_ok=halss_stats["output_points"] >= 10,
                     landed_state_on_ground=landed_state_on_ground,
                     offboard_active=getattr(self.fc, "isOffboard", None),
@@ -1745,17 +2231,6 @@ class OrinLandingPipeline:
                           f"landed={state_decision.landed} abort={state_decision.abort}",
                           flush=True)
                     first_frame = False
-
-                # --- MAVROS 安全 fallback: OFFBOARD 丢失或 disarm → ABORT ---
-                if self.fc is not None and self.fc.safety_fallback:
-                    logger.error(
-                        "[Pipeline] MAVROS safety fallback: %s → ABORT",
-                        self.fc.safety_fallback_reason,
-                    )
-                    self.mission_state = "ABORT"
-                    await self._stop_recording()
-                    await self._emergency_stop()
-                    break
 
                 # --- FAST-LIO 健康退化动作 ---
                 if health.degraded_action is not None and not self._px4_pose_authoritative:
@@ -1815,6 +2290,23 @@ class OrinLandingPipeline:
                     break
 
                 if not state_decision.allow_drl and not state_decision.direct_land:
+                    if (
+                        state_decision.state.value == "HOLD_FOR_MANUAL"
+                        and state_decision.reason == "perception_timeout_manual_takeover"
+                    ):
+                        if self._perception_hold_enu_xyz is None:
+                            self._perception_hold_enu_xyz = np.asarray(
+                                self.fc.uavPosENU, dtype=np.float32,
+                            ).copy()
+                        self._log_mission_event(
+                            "MANUAL_TAKEOVER_REQUESTED",
+                            reason=state_decision.reason,
+                        )
+                        await self._hold_for_manual_takeover(
+                            hold_xyz=self._perception_hold_enu_xyz,
+                            yaw_rate_rad_s=self.yaw_rate_cmd,
+                        )
+                        break
                     if state_decision.state.value == "IDLE":
                         logger.warning(
                             "[Pipeline] Control loop left active flight state: reason=%s",
@@ -1840,6 +2332,33 @@ class OrinLandingPipeline:
                     await asyncio.sleep(max(0.0, self.sim_dt - (time.perf_counter() - loop_start)))
                     continue
 
+                if (
+                    not state_decision.direct_land
+                    and halss_stats["output_points"] < 10
+                ):
+                    await self._hold_for_perception_failure(
+                        "roi_sparse", control_pose, sync_ms,
+                    )
+                    self._record_worker_rejection(
+                        cloud_stamp_ros_s=cloud_stamp_ros_s,
+                        cloud_seq=cloud_seq, pose_seq=pose_seq,
+                        state=state_decision.state.value, sync_ms=sync_ms,
+                        pointcloud_preprocess_s=t_p1 - t_p0,
+                        fallback_reason="roi_sparse",
+                        detailed_profile=active_profile,
+                    )
+                    self.step_count += 1
+                    if self.mission_state == "HOLD_FOR_MANUAL":
+                        await self._hold_for_manual_takeover(
+                            hold_xyz=self._perception_hold_enu_xyz,
+                            yaw_rate_rad_s=self.yaw_rate_cmd,
+                        )
+                        break
+                    await asyncio.sleep(max(
+                        0.0, self.sim_dt - (time.perf_counter() - loop_start)
+                    ))
+                    continue
+
                 if state_decision.direct_land:
                     t_h0 = t_h1 = time.perf_counter()
                     sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
@@ -1863,137 +2382,63 @@ class OrinLandingPipeline:
                     action_yaw_rate = self.yaw_rate_cmd if state_decision.continue_yaw_rate else 0.0
                     t_r1 = time.perf_counter()
                 else:
-                    active_stage = "halss"
-                    t_h0 = time.perf_counter()
                     roi_bounds = self._roi_bounds()
-                    try:
-                        halss_result = self.halss.evaluate(
-                            halss_points, fixed_bounds=roi_bounds,
-                            profile=active_profile,
+                    active_stage = "isolated_perception"
+                    worker_job = {
+                        "cloud_seq": int(cloud_seq),
+                        "cloud_stamp_ros_s": cloud_stamp_ros_s,
+                        "halss_points": np.asarray(halss_points, dtype=np.float32),
+                        "projection_points": np.asarray(projection_points, dtype=np.float32),
+                        "roi_bounds": roi_bounds,
+                        "half_x": float(self._roi_half_x),
+                        "half_y": float(self._roi_half_y),
+                        "profile": active_profile,
+                    }
+                    worker_result = await self._run_worker_job(
+                        worker_job, control_pose, sync_ms,
+                    )
+                    if worker_result is None:
+                        self._record_worker_rejection(
+                            cloud_stamp_ros_s=cloud_stamp_ros_s,
+                            cloud_seq=cloud_seq, pose_seq=pose_seq,
+                            state=state_decision.state.value, sync_ms=sync_ms,
+                            pointcloud_preprocess_s=t_p1 - t_p0,
+                            fallback_reason=(
+                                self._last_worker_rejection_reason
+                                or "isolated_perception_unavailable"
+                            ),
+                            detailed_profile=active_profile,
                         )
-                    finally:
-                        if active_profile is not None:
-                            active_profile.setdefault(
-                                "halss_total_ms",
-                                (time.perf_counter() - t_h0) * 1000.0,
+                        self.step_count += 1
+                        if self.mission_state == "HOLD_FOR_MANUAL":
+                            await self._hold_for_manual_takeover(
+                                hold_xyz=self._perception_hold_enu_xyz,
+                                yaw_rate_rad_s=self.yaw_rate_cmd,
                             )
-                    t_h1 = time.perf_counter()
-                    if halss_stats["output_points"] < 10:
-                        logger.warning(
-                            "[Pipeline] HALSS level-body ROI sparse: roi=%d/%d "
-                            "half=(%.1f,%.1f)m height=%.1fm z=[%.2f, %.2f]",
-                            halss_stats["output_points"],
-                            halss_stats["input_points"],
-                            dyn_half_x,
-                            dyn_half_y,
-                            dyn_height,
-                            halss_stats["z_min_body"],
-                            halss_stats["z_max_body"],
-                        )
+                            break
+                        await asyncio.sleep(max(
+                            0.0, self.sim_dt - (time.perf_counter() - loop_start)
+                        ))
+                        continue
 
-                    active_stage = "semantic_generation"
-                    semantic_start = time.perf_counter()
-                    if halss_result is not None:
-                        bev_data = halss_result.get("bev_data", halss_result)
-                        sem_map = self.sem_gen.generate(bev_data)
-                    else:
-                        sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
-                    binary_semantic_vis = make_binary_semantic_vis(
-                        sem_map,
-                        safe_id=self.safe_id,
-                        danger_id=self.danger_id,
-                    )
-                    if active_profile is not None:
-                        active_profile["semantic_generation_ms"] = (
-                            time.perf_counter() - semantic_start
-                        ) * 1000.0
-
-                    active_stage = "depth_projection"
-                    t_d0 = time.perf_counter()
-                    semantic_valid_mask = np.ones_like(sem_map, dtype=bool)
-                    if self._projection_mode == "training_camera":
-                        sparse_depth, valid_mask, sem_map, semantic_valid_mask = (
-                            project_training_camera(
-                                projection_points,
-                                sem_map,
-                                roi_bounds,
-                                self._training_camera,
-                                danger_id=self.danger_id,
-                            )
-                        )
-                        binary_semantic_vis = make_binary_semantic_vis(
-                            sem_map,
-                            safe_id=self.safe_id,
-                            danger_id=self.danger_id,
-                        )
-                        binary_semantic_vis[~semantic_valid_mask] = 128
-                    else:
-                        sparse_depth, _ = project_bev_depth(
-                            halss_points,
-                            grid_res=int(self.cfg["perception"].get("halss_grid_res", 64)),
-                            out_size=self.obs_w,
-                            max_range=self.depth_max,
-                            half_x=self._roi_half_x,
-                            half_y=self._roi_half_y,
-                        )
-                        valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
-                    t_d1 = time.perf_counter()
-                    if active_profile is not None:
-                        active_profile["depth_projection_ms"] = (t_d1 - t_d0) * 1000.0
-
-                    active_stage = "observation_generation"
-                    t_c0 = time.perf_counter()
-                    rendered_depth = render_sparse_depth(sparse_depth, valid_mask, self.depth_max)
-                    t_c1 = time.perf_counter()
-                    if active_profile is not None:
-                        active_profile["depth_completion_ms"] = (t_c1 - t_c0) * 1000.0
-                        active_profile["depth_valid_ratio"] = float(np.mean(valid_mask))
-                        active_profile["semantic_valid_ratio"] = float(
-                            np.mean(semantic_valid_mask)
-                        )
-                        valid_depth = sparse_depth[valid_mask]
-                        active_profile["depth_mean_m"] = (
-                            float(np.mean(valid_depth)) if valid_depth.size else None
-                        )
-                        active_profile["depth_max_m"] = (
-                            float(np.max(valid_depth)) if valid_depth.size else None
-                        )
-                        variance = (
-                            halss_result.get("variance_map")
-                            if halss_result is not None else None
-                        )
-                        if variance is not None:
-                            active_profile["uncertainty_mean"] = float(np.mean(variance))
-                            active_profile["uncertainty_max"] = float(np.max(variance))
-
-                    active_stage = "onnx_inference"
-                    t_r0 = time.perf_counter()
-                    # ── DEBUG: DRL input ──
-                    logger.debug(
-                        "[DEBUG_DRL_INPUT] depth_valid=%d/%d semantic_valid=%d/%d "
-                        "depth_range=[%.2f,%.2f] sem_unique=%s",
-                        int(np.sum(valid_mask)), valid_mask.size,
-                        int(np.sum(sem_map != self.danger_id)), sem_map.size,
-                        float(np.min(rendered_depth)), float(np.max(rendered_depth)),
-                        sorted(np.unique(sem_map).tolist()),
-                    )
-                    action_id, rl_info = self.drl.predict(
-                        rendered_depth, sem_map, profile=active_profile,
-                    )
-                    rl_info["semantic_valid_ratio"] = float(np.mean(semantic_valid_mask))
+                    timing = worker_result["timing"]
+                    active_profile = worker_result.get("profile") or active_profile
                     t_r1 = time.perf_counter()
-                    if active_profile is not None:
-                        active_profile["policy_total_ms"] = (t_r1 - t_r0) * 1000.0
-                        active_profile["observation_generation_ms"] = (
-                            active_profile.get("observation_ready_perf", t_r0)
-                            - semantic_start
-                        )
-                        active_profile["observation_generation_ms"] *= 1000.0
-                        observation_ready = active_profile.get("observation_ready_perf", t_r0)
-                        active_profile["perception_total_ms"] = (
-                            observation_ready - loop_start
-                        ) * 1000.0
-                    # ── DEBUG: DRL output ──
+                    t_r0 = t_r1 - float(timing["onnx_ms"]) / 1000.0
+                    t_c1 = t_r0
+                    t_c0 = t_c1 - float(timing["completion_ms"]) / 1000.0
+                    t_d1 = t_c0
+                    t_d0 = t_d1 - float(timing["depth_ms"]) / 1000.0
+                    t_h1 = t_d0
+                    t_h0 = t_h1 - float(timing["halss_ms"]) / 1000.0
+                    sem_map = worker_result["sem_map"]
+                    binary_semantic_vis = worker_result["binary_semantic_vis"]
+                    sparse_depth = worker_result["sparse_depth"]
+                    valid_mask = worker_result["valid_mask"]
+                    semantic_valid_mask = worker_result["semantic_valid_mask"]
+                    rendered_depth = worker_result["rendered_depth"]
+                    action_id = int(worker_result["action_id"])
+                    rl_info = worker_result["rl_info"]
                     logger.info(
                         "[DEBUG_DRL_OUTPUT] action_id=%d action_name=%s "
                         "confidence=%.3f probs=%s",
@@ -2002,7 +2447,7 @@ class OrinLandingPipeline:
                         float(rl_info.get("confidence", -1)),
                         _top_probs(rl_info.get("action_probs")),
                     )
-                    print(f"  ONNX {int((t_r1 - t_r0) * 1000)}ms act={action_id}", flush=True)
+                    print(f"  ONNX {int(timing['onnx_ms'])}ms act={action_id}", flush=True)
 
                     active_stage = "action_mapping"
                     action_mapping_start = time.perf_counter()
@@ -2051,13 +2496,8 @@ class OrinLandingPipeline:
                         and not state_decision.direct_land):
                     active_stage = "stale_result_fallback"
                     stale_control_start = time.perf_counter()
-                    await self._send_zero_velocity_logged(
-                        action_yaw_rate, time.perf_counter(),
-                        state=state_decision.state.value,
-                        reason=state_decision.reason,
-                        pose_xyz=frame_pose,
-                        sync_ms=sync_ms,
-                        fallback_reason="inference_result_too_old",
+                    await self._hold_for_perception_failure(
+                        "inference_result_too_old", control_pose, sync_ms,
                     )
                     stale_control_end = time.perf_counter()
                     if active_profile is not None:
@@ -2258,15 +2698,19 @@ class OrinLandingPipeline:
 
         except KeyboardInterrupt:
             logger.info("[Pipeline] Interrupted by user.")
+            self._shutdown_reason = "keyboard_interrupt"
+            self._log_mission_event("INTERRUPTED", reason="KeyboardInterrupt")
             self.mission_state = "ABORT"
         except Exception as e:
+            import traceback
+            traceback_text = traceback.format_exc()
+            self._record_fatal_error(e, traceback_text)
             if active_profile is not None and not active_profile_logged:
                 try:
                     self._log_profile_failure(active_profile, active_stage, e)
                 except Exception as log_error:
                     logger.warning("[Profiling] Failed to log fatal frame: %s", log_error)
             logger.error("[Pipeline] Fatal error: %s", e)
-            import traceback
             traceback.print_exc()
             self.mission_state = "ABORT"
             await self._emergency_stop()
@@ -2274,6 +2718,41 @@ class OrinLandingPipeline:
     # ------------------------------------------------------------------
     # Control helpers
     # ------------------------------------------------------------------
+
+    async def _check_active_flight_safety(self, phase: str) -> bool:
+        """Handle a new OFFBOARD/disarm transition in the phase where it occurs."""
+        if self.fc is None:
+            return True
+        armed = getattr(self.fc, "isArmed", None)
+        offboard = getattr(self.fc, "isOffboard", None)
+        mode = getattr(self.fc, "flightMode", None)
+        latched = bool(getattr(self.fc, "safety_fallback", False))
+        latched_reason = str(getattr(self.fc, "safety_fallback_reason", "") or "")
+        if armed is True and offboard is True and not latched:
+            return True
+
+        reason = (
+            f"phase={phase};latched={int(latched)};"
+            f"fallback_reason={latched_reason or 'current_state_invalid'};"
+            f"armed={armed};offboard={offboard};mode={mode}"
+        )
+        self._shutdown_reason = f"mavros_safety_fallback:{reason}"
+        self._log_mission_event("MAVROS_SAFETY_FALLBACK", reason=reason)
+        logger.error("[Pipeline] MAVROS safety fallback: %s", reason)
+
+        if armed is False:
+            self.mission_state = "LANDED"
+            self._log_mission_event("DISARMED", reason=f"px4_disarmed;phase={phase}")
+        elif offboard is False:
+            self.mission_state = "IDLE"
+            self._log_mission_event("MANUAL_TAKEOVER", reason=f"offboard_exited;phase={phase}")
+        else:
+            # A brief transition was latched between loop iterations even
+            # though the latest sample has recovered. Preserve the existing
+            # conservative behavior for that genuinely new in-flight event.
+            self.mission_state = "ABORT"
+            await self._emergency_stop()
+        return False
 
     async def _send_zero_velocity(self, yaw_rate_rad_s: float, now: float) -> None:
         """Hold a fixed PX4 ENU XY point instead of relying on zero velocity."""
@@ -2352,270 +2831,112 @@ class OrinLandingPipeline:
         )
 
     async def _warmup_perception(self):
-        """Warm CUDA, then accept one newer full inference within the age budget.
-
-        Cold startup and fresh-frame validation have independent time budgets.
-        The cold result and every cloud received while it runs are discarded.
-        Validation always waits for the newest subsequent cloud, and one valid
-        inference is sufficient to unblock descent. Returns that validated
-        ``cloud_seq``; failures return ``None``.
-        """
-        phase = "cold"
-        phase_start = time.perf_counter()
-        fresh_after_cloud_seq = None
-        wait_counts = {"cold": {}, "fresh": {}}
-        last_wait_log = 0.0
-        last_wait_reason = None
-
-        def report_wait(reason: str, detail: str) -> None:
-            nonlocal last_wait_log, last_wait_reason
-            counts = wait_counts[phase]
-            counts[reason] = counts.get(reason, 0) + 1
-            now = time.perf_counter()
-            if reason != last_wait_reason or now - last_wait_log >= 1.0:
-                print(
-                    f"  Warmup {phase} waiting: reason={reason} {detail}",
-                    flush=True,
-                )
-                last_wait_log = now
-                last_wait_reason = reason
-
-        while True:
-            timeout_s = (
-                self.cold_warmup_timeout_s
-                if phase == "cold"
-                else self.fresh_validation_timeout_s
-            )
-            if time.perf_counter() - phase_start >= timeout_s:
-                summary = ", ".join(
-                    f"{reason}={count}"
-                    for reason, count in sorted(wait_counts[phase].items())
-                ) or "none"
-                phase_text = "cold phase" if phase == "cold" else "fresh validation"
-                print(
-                    f"  Warmup {phase_text} timeout after {timeout_s:.1f}s "
-                    f"(waits: {summary}) — requesting manual takeover",
-                    flush=True,
-                )
-                return None
-
-            warmup_profile = (
-                {
-                    "frame_start_perf": time.perf_counter(),
-                    "timestamp": self._ros_time_now_s(),
-                    "state": "WARMUP_COLD" if phase == "cold" else "WARMUP_FRESH",
-                }
-                if self.enable_detailed_profiling else None
-            )
-            warmup_stage = "sensor_snapshot"
-            frame_pts, frame_pose, cloud_seq, pose_seq, sync_ms = self._grab_latest_snapshot(
-                warmup_profile
-            )
-            cloud_stamp = self.fastlio.points_stamp
-            if self.fc is not None and (
-                getattr(self.fc, "isOffboard", None) is False
-                or getattr(self.fc, "isArmed", None) is False
-            ):
-                print("  Warmup cancelled: vehicle is not armed in OFFBOARD", flush=True)
-                return None
-
-            if phase == "fresh":
-                if (
-                    fresh_after_cloud_seq is None
-                    or cloud_seq <= fresh_after_cloud_seq
-                ):
-                    report_wait(
-                        "no_fresh_cloud",
-                        f"cloud_seq={cloud_seq} need>{fresh_after_cloud_seq}",
-                    )
-                    await asyncio.sleep(0.01)
-                    continue
-                # Consume each new cloud once. A failed candidate must not be
-                # retried while newer sensor data is available.
-                fresh_after_cloud_seq = cloud_seq
-
-            if frame_pts is None:
-                report_wait("pointcloud_missing", f"cloud_seq={cloud_seq}")
-                await asyncio.sleep(0.1)
-                continue
-            if frame_pose is None:
-                report_wait("matched_pose_missing", f"cloud_seq={cloud_seq}")
-                await asyncio.sleep(0.05)
-                continue
-            if sync_ms is None:
-                report_wait("sync_missing", f"cloud_seq={cloud_seq}")
-                await asyncio.sleep(0.05)
+        """Warm and validate the isolated child on two distinct sensor frames."""
+        cold_deadline = time.perf_counter() + self.cold_warmup_timeout_s
+        cold_seq = None
+        while time.perf_counter() < cold_deadline:
+            frame_pts, frame_pose, cloud_seq, pose_seq, sync_ms = self._grab_latest_snapshot()
+            if frame_pts is None or frame_pose is None or sync_ms is None:
+                await asyncio.sleep(0.02)
                 continue
             if sync_ms > self.max_cloud_odom_sync_ms:
-                report_wait(
-                    "sync_too_large",
-                    f"sync_ms={sync_ms:.1f} limit={self.max_cloud_odom_sync_ms:.1f}",
-                )
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.02)
                 continue
-
-            t0 = time.perf_counter()
-            try:
-                if warmup_profile is not None:
-                    self._profiling_frame_id += 1
-                    warmup_profile.update({
-                        "frame_id": self._profiling_frame_id,
-                        "cloud_seq": cloud_seq,
-                        "pose_seq": pose_seq,
-                    })
-                # Dynamic FOV ROI
-                dyn_half_x, dyn_half_y, _ = self._compute_roi_half_from_height(
-                    float(frame_pose[2]), None
-                )
-                roi_bounds = {
+            dyn_half_x, dyn_half_y, _ = self._compute_roi_half_from_height(
+                float(frame_pose[2]), None,
+            )
+            halss_pts, projection_pts, stats = self._prepare_halss_points(
+                frame_pts, frame_pose, frame_pose, dyn_half_x, dyn_half_y,
+            )
+            if int(stats.get("output_points", 0)) < 10:
+                await asyncio.sleep(0.02)
+                continue
+            job = {
+                "cloud_seq": int(cloud_seq),
+                "cloud_stamp_ros_s": self.fastlio.points_stamp,
+                "halss_points": np.asarray(halss_pts, dtype=np.float32),
+                "projection_points": np.asarray(projection_pts, dtype=np.float32),
+                "roi_bounds": {
                     "x_min": -dyn_half_x, "x_max": dyn_half_x,
                     "y_min": -dyn_half_y, "y_max": dyn_half_y,
-                }
+                },
+                "half_x": float(dyn_half_x), "half_y": float(dyn_half_y),
+                "profile": None,
+            }
+            t0 = time.perf_counter()
+            result = await self._run_worker_job(
+                job, frame_pose, sync_ms, cold_warmup=True,
+            )
+            if result is None:
+                if not await self._wait_perception_worker_ready(
+                    max(0.1, cold_deadline - time.perf_counter())
+                ):
+                    return None
+                continue
+            cold_seq = max(
+                int(cloud_seq), int(getattr(self.fastlio, "points_seq", cloud_seq))
+            )
+            print(
+                f"  Warmup cold pass: act={result['action_id']}"
+                f"({self.decomposer.action_id_to_name(result['action_id'])}) "
+                f"dt={(time.perf_counter() - t0) * 1000.0:.0f}ms; "
+                f"waiting for cloud_seq>{cold_seq} with a new "
+                f"{self.fresh_validation_timeout_s:.1f}s budget...",
+                flush=True,
+            )
+            break
+        if cold_seq is None:
+            print("  Warmup cold phase timeout — requesting manual takeover", flush=True)
+            return None
 
-                # HALSS
-                warmup_stage = "halss_projection"
-                stage_start = time.perf_counter()
-                halss_pts, projection_pts, halss_stats = self._prepare_halss_points(
-                    frame_pts, frame_pose, frame_pose, dyn_half_x, dyn_half_y,
-                )
-                if warmup_profile is not None:
-                    warmup_profile["halss_projection_ms"] = (
-                        time.perf_counter() - stage_start
-                    ) * 1000.0
-                    warmup_profile["valid_projection_points"] = int(
-                        halss_stats.get("frustum_points", halss_stats.get("output_points", 0))
-                    )
-                output_points = int(halss_stats.get("output_points", 0))
-                if output_points < 10:
-                    report_wait(
-                        "roi_sparse",
-                        f"points={output_points} minimum=10 cloud_seq={cloud_seq}",
-                    )
-                    await asyncio.sleep(0.05)
-                    continue
-                warmup_stage = "halss"
-                stage_start = time.perf_counter()
-                try:
-                    halss_result = self.halss.evaluate(
-                        halss_pts, fixed_bounds=roi_bounds, profile=warmup_profile,
-                    )
-                finally:
-                    if warmup_profile is not None:
-                        warmup_profile.setdefault(
-                            "halss_total_ms",
-                            (time.perf_counter() - stage_start) * 1000.0,
-                        )
-
-                # Semantic
-                warmup_stage = "semantic_generation"
-                stage_start = time.perf_counter()
-                if halss_result is not None:
-                    bev_data = halss_result.get("bev_data", halss_result)
-                    sem_map = self.sem_gen.generate(bev_data)
-                else:
-                    sem_map = np.full((self.obs_h, self.obs_w), self.danger_id, dtype=np.uint8)
-                if warmup_profile is not None:
-                    warmup_profile["semantic_generation_ms"] = (
-                        time.perf_counter() - stage_start
-                    ) * 1000.0
-
-                # Depth
-                warmup_stage = "depth_projection"
-                stage_start = time.perf_counter()
-                if self._projection_mode == "training_camera":
-                    sparse_depth, valid_mask, sem_map, _ = project_training_camera(
-                        projection_pts, sem_map, roi_bounds, self._training_camera,
-                        danger_id=self.danger_id,
-                    )
-                else:
-                    sparse_depth, _ = project_bev_depth(
-                        halss_pts,
-                        grid_res=int(self.cfg["perception"].get("halss_grid_res", 64)),
-                        out_size=self.obs_w, max_range=self.depth_max,
-                        half_x=dyn_half_x, half_y=dyn_half_y,
-                    )
-                    valid_mask = (sparse_depth < self.depth_max) & (sparse_depth > 0.01)
-                if warmup_profile is not None:
-                    warmup_profile["depth_projection_ms"] = (
-                        time.perf_counter() - stage_start
-                    ) * 1000.0
-                warmup_stage = "observation_generation"
-                rendered_depth = render_sparse_depth(sparse_depth, valid_mask, self.depth_max)
-
-                # DRL inference (the main warmup target)
-                warmup_stage = "onnx_inference"
-                action_id, _ = self.drl.predict(
-                    rendered_depth, sem_map, profile=warmup_profile,
-                )
-                action_name = self.decomposer.action_id_to_name(action_id)
-
-                dt = (time.perf_counter() - t0) * 1000
-                result_age_ms = dt
-                if cloud_stamp is not None:
-                    result_age_ms = max(
-                        result_age_ms,
-                        (self._ros_time_now_s() - float(cloud_stamp)) * 1000.0,
-                    )
-                if phase == "cold":
-                    # Drop the cold input plus all clouds accumulated while CUDA
-                    # initialized. Fresh validation starts with its own timer.
-                    latest_cloud_seq = int(
-                        getattr(self.fastlio, "points_seq", cloud_seq)
-                    )
-                    fresh_after_cloud_seq = max(int(cloud_seq), latest_cloud_seq)
-                    print(
-                        f"  Warmup cold pass: act={action_id}({action_name}) "
-                        f"dt={dt:.0f}ms; waiting for cloud_seq>"
-                        f"{fresh_after_cloud_seq} with a new {self.fresh_validation_timeout_s:.1f}s budget...",
-                        flush=True,
-                    )
-                    phase = "fresh"
-                    phase_start = time.perf_counter()
-                    last_wait_log = 0.0
-                    last_wait_reason = None
-                    await asyncio.sleep(0.01)
-                    continue
-                if result_age_ms > self.max_inference_result_age_ms:
-                    # Clouds received during this rejected inference are already
-                    # stale relative to its completion; wait for a newer one.
-                    fresh_after_cloud_seq = max(
-                        int(fresh_after_cloud_seq),
-                        int(getattr(self.fastlio, "points_seq", cloud_seq)),
-                    )
-                    report_wait(
-                        "result_too_old",
-                        f"dt={dt:.0f}ms result_age={result_age_ms:.0f}ms "
-                        f"limit={self.max_inference_result_age_ms:.0f}ms "
-                        f"next_cloud_seq>{fresh_after_cloud_seq}",
-                    )
-                    await asyncio.sleep(0.01)
-                    continue
-                print(
-                    f"  Warmup validated: act={action_id}({action_name}) "
-                    f"dt={dt:.0f}ms result_age={result_age_ms:.0f}ms "
-                    f"<= {self.max_inference_result_age_ms:.0f}ms",
-                    flush=True,
-                )
-                return int(cloud_seq)
-            except Exception as e:
-                wait_counts[phase]["inference_error"] = (
-                    wait_counts[phase].get("inference_error", 0) + 1
-                )
-                if warmup_profile is not None:
-                    try:
-                        self._log_profile_failure(warmup_profile, warmup_stage, e)
-                    except Exception as log_error:
-                        logger.warning("[Profiling] Failed to log warmup error: %s", log_error)
-                if phase == "fresh":
-                    fresh_after_cloud_seq = max(
-                        int(fresh_after_cloud_seq),
-                        int(getattr(self.fastlio, "points_seq", cloud_seq)),
-                    )
-                print(
-                    f"  Warmup {phase} error at {warmup_stage}: {e}; retrying...",
-                    flush=True,
-                )
-                await asyncio.sleep(0.2)
+        fresh_deadline = time.perf_counter() + self.fresh_validation_timeout_s
+        last_candidate = cold_seq
+        while time.perf_counter() < fresh_deadline:
+            frame_pts, frame_pose, cloud_seq, pose_seq, sync_ms = self._grab_latest_snapshot()
+            if cloud_seq <= last_candidate:
+                await asyncio.sleep(0.01)
+                continue
+            last_candidate = int(cloud_seq)
+            if frame_pts is None or frame_pose is None or sync_ms is None:
+                continue
+            if sync_ms > self.max_cloud_odom_sync_ms:
+                continue
+            dyn_half_x, dyn_half_y, _ = self._compute_roi_half_from_height(
+                float(frame_pose[2]), None,
+            )
+            halss_pts, projection_pts, stats = self._prepare_halss_points(
+                frame_pts, frame_pose, frame_pose, dyn_half_x, dyn_half_y,
+            )
+            if int(stats.get("output_points", 0)) < 10:
+                continue
+            job = {
+                "cloud_seq": int(cloud_seq),
+                "cloud_stamp_ros_s": self.fastlio.points_stamp,
+                "halss_points": np.asarray(halss_pts, dtype=np.float32),
+                "projection_points": np.asarray(projection_pts, dtype=np.float32),
+                "roi_bounds": {
+                    "x_min": -dyn_half_x, "x_max": dyn_half_x,
+                    "y_min": -dyn_half_y, "y_max": dyn_half_y,
+                },
+                "half_x": float(dyn_half_x), "half_y": float(dyn_half_y),
+                "profile": None,
+            }
+            t0 = time.perf_counter()
+            result = await self._run_worker_job(job, frame_pose, sync_ms)
+            if result is None:
+                continue
+            self._last_valid_perception_perf = time.perf_counter()
+            print(
+                f"  Warmup validated: act={result['action_id']}"
+                f"({self.decomposer.action_id_to_name(result['action_id'])}) "
+                f"dt={(time.perf_counter() - t0) * 1000.0:.0f}ms "
+                f"result_age={result['result_age_ms']:.0f}ms "
+                f"<= {self.max_inference_result_age_ms:.0f}ms",
+                flush=True,
+            )
+            return int(cloud_seq)
+        print("  Warmup fresh validation timeout — requesting manual takeover", flush=True)
+        return None
 
     async def _vertical_takeoff(
         self,
@@ -2661,6 +2982,8 @@ class OrinLandingPipeline:
 
         # 1a. Proportional 3-D velocity to the selected staging point.
         while True:
+            if not await self._check_active_flight_safety("TAKEOFF"):
+                return False
             current = np.asarray(self.fc.uavPosENU, dtype=np.float32)
             dx = float(target_x - current[0])
             dy = float(target_y - current[1])
@@ -2708,6 +3031,8 @@ class OrinLandingPipeline:
             reason=f"yaw_rate_rad_s={self.yaw_rate_cmd:.6f};duration_s=2.0",
         )
         for _ in range(20):  # ~2s
+            if not await self._check_active_flight_safety("TAKEOFF_STAGING_HOVER"):
+                return False
             await self.fc.send_position_enu_yaw_rate(
                 target_x, target_y, target_z,
                 self.yaw_rate_cmd,
@@ -2753,6 +3078,8 @@ class OrinLandingPipeline:
             target_enu_x, target_enu_y, target_enu_z,
             self._goto_tolerance_xy, self._goto_tolerance_z, speed_text,
         )
+        if not await self._check_active_flight_safety("GOTO_SAFE"):
+            return
 
         # Continue the yaw-rate started during the staging hover and seed the
         # GOTO heartbeat before checking arrival.
@@ -2777,6 +3104,8 @@ class OrinLandingPipeline:
 
         goto_start = time.perf_counter()
         while self.mission_state == "GOTO_SAFE":
+            if not await self._check_active_flight_safety("GOTO_SAFE"):
+                break
             current_enu = self.fc.uavPosENU if hasattr(self.fc, 'uavPosENU') else np.zeros(3)
             dist_xy = math.sqrt(
                 (target_enu_x - current_enu[0])**2 + (target_enu_y - current_enu[1])**2
@@ -2826,6 +3155,8 @@ class OrinLandingPipeline:
                         "MANUAL_TAKEOVER_REQUESTED",
                         reason="safe_point_stabilization_timeout",
                     )
+                    break
+                if stabilization == "safety_exit":
                     break
                 logger.info(
                     "[GOTO_SAFE] Position left %.2fm/%.2fm capture tolerance; reacquiring",
@@ -2923,14 +3254,8 @@ class OrinLandingPipeline:
 
         while True:
             now = time.perf_counter()
-            if self.fc is not None and (
-                getattr(self.fc, "isOffboard", None) is False
-                or getattr(self.fc, "isArmed", None) is False
-            ):
-                logger.warning(
-                    "[GOTO_STABLE] Cancelled because vehicle left armed OFFBOARD"
-                )
-                return "timeout"
+            if not await self._check_active_flight_safety("GOTO_STABLE"):
+                return "safety_exit"
             current = np.asarray(self.fc.uavPosENU, dtype=np.float32)
             dist_xy = math.hypot(
                 target_enu_x - float(current[0]),
@@ -3002,19 +3327,35 @@ class OrinLandingPipeline:
                 last_log = now
             await asyncio.sleep(0.05)
 
-    async def _hold_for_manual_takeover(self):
-        """Hold the current PX4 pose until the pilot exits OFFBOARD or disarms."""
-        hold = np.asarray(self.fc.uavPosENU, dtype=np.float32).copy()
+    async def _hold_for_manual_takeover(self, hold_xyz=None,
+                                        yaw_rate_rad_s=None):
+        """Hold a fixed PX4 pose until the pilot exits OFFBOARD or disarms."""
+        hold = (
+            np.asarray(self.fc.uavPosENU, dtype=np.float32).copy()
+            if hold_xyz is None
+            else np.asarray(hold_xyz, dtype=np.float32).copy()
+        )
+        use_yaw_rate = yaw_rate_rad_s is not None
         yaw_deg = math.degrees(float(self.fc.uavYawENU))
         logger.warning(
-            "[ManualHold] Holding ENU=%s yaw=%.1fdeg; pilot must switch out of OFFBOARD",
-            _fmt_vec(hold), yaw_deg,
+            "[ManualHold] Holding ENU=%s %s; pilot must switch out of OFFBOARD",
+            _fmt_vec(hold),
+            (
+                f"yaw_rate={float(yaw_rate_rad_s):.3f}rad/s"
+                if use_yaw_rate else f"yaw={yaw_deg:.1f}deg"
+            ),
         )
         last_notice = 0.0
         while bool(getattr(self.fc, "isArmed", False)) and bool(getattr(self.fc, "isOffboard", False)):
-            await self.fc.send_position_enu_yaw(
-                float(hold[0]), float(hold[1]), float(hold[2]), yaw_deg,
-            )
+            if use_yaw_rate:
+                await self.fc.send_position_enu_yaw_rate(
+                    float(hold[0]), float(hold[1]), float(hold[2]),
+                    float(yaw_rate_rad_s),
+                )
+            else:
+                await self.fc.send_position_enu_yaw(
+                    float(hold[0]), float(hold[1]), float(hold[2]), yaw_deg,
+                )
             now = time.perf_counter()
             if now - last_notice >= 1.0:
                 logger.warning("[ManualHold] Waiting for pilot takeover; OFFBOARD remains active")
@@ -3051,14 +3392,19 @@ class OrinLandingPipeline:
             raise RuntimeError("[GlobalPrior] Home GPS is unavailable; cannot convert safe point to NED.")
         home_lat = self._home_lat
         home_lon = self._home_lon
+        horizontal_reference_ned = (
+            self._home_ned
+            if self._gps_reference_ned is None
+            else self._gps_reference_ned
+        )
         meters_per_deg_lat = 111320.0
         meters_per_deg_lon = 111320.0 * math.cos(math.radians(home_lat))
         dn = (lat - home_lat) * meters_per_deg_lat
         de = (lon - home_lon) * meters_per_deg_lon
         dd = self._home_ned[2] - alt_m  # NED down: alt_m 高于起飞点 → dd < home_ned[2]
         return np.array([
-            float(self._home_ned[0]) + dn,
-            float(self._home_ned[1]) + de,
+            float(horizontal_reference_ned[0]) + dn,
+            float(horizontal_reference_ned[1]) + de,
             dd,
         ], dtype=np.float32)
 
@@ -3183,6 +3529,25 @@ class OrinLandingPipeline:
                 fallback_reason=fallback_reason,
                 detailed_profile=detailed_profile,
             )
+
+    def _record_worker_rejection(
+        self, *, cloud_stamp_ros_s, cloud_seq, pose_seq, state, sync_ms,
+        pointcloud_preprocess_s, fallback_reason, detailed_profile=None,
+    ) -> None:
+        """Persist every discarded isolated-perception attempt immediately."""
+        self._record_timing(
+            0.0, 0.0, 0.0, 0.0, 0.0, pointcloud_preprocess_s,
+            cloud_stamp_ros_s=cloud_stamp_ros_s,
+            cloud_seq=cloud_seq,
+            pose_seq=pose_seq,
+            state=state,
+            sync_ms=sync_ms,
+            accepted=False,
+            fallback_reason=fallback_reason,
+            perception_executed=True,
+            pointcloud_preprocess_s=pointcloud_preprocess_s,
+            detailed_profile=detailed_profile,
+        )
 
     def _apply_state_decision(self, decision):
         self.mission_state = decision.state.value
@@ -3416,6 +3781,17 @@ class OrinLandingPipeline:
 
     async def _shutdown(self):
         logger.info("[Pipeline] Shutting down...")
+        if not self._shutdown_event_logged:
+            fc = self.fc
+            reason = self._shutdown_reason or f"mission_state={self.mission_state}"
+            reason = (
+                f"{reason};armed={getattr(fc, 'isArmed', None)};"
+                f"offboard={getattr(fc, 'isOffboard', None)};"
+                f"mode={getattr(fc, 'flightMode', None)}"
+            )
+            self._log_mission_event("SHUTDOWN_REASON", reason=reason)
+            self._shutdown_event_logged = True
+        self._stop_perception_worker(graceful=True)
         try:
             if self.fc is not None:
                 await self.fc.send_velocity_enu_yaw_rate(0.0, 0.0, 0.0, 0.0)
@@ -3529,10 +3905,14 @@ class OrinLandingPipeline:
             "gate_stage", "accepted", "reason", "cloud_source",
         ])
         self._perception_gate_file.flush()
+        self._perception_stage_log_path = self._run_dir / "perception_stage.log"
+        # Create the file before the spawn child opens it with O_APPEND.
+        self._perception_stage_log_path.touch(exist_ok=True)
+        self._start_diagnostic_log_writer()
         logger.info(
-            "[RunDir] Timeline: %s; frame timing: %s",
-            self._event_log_path,
-            self._frame_timing_path,
+            "[RunDir] Timeline: %s; frame timing: %s; stage trace: %s",
+            self._event_log_path, self._frame_timing_path,
+            self._perception_stage_log_path,
         )
 
         # Config snapshot
@@ -3574,6 +3954,10 @@ class OrinLandingPipeline:
             "profiling_enabled": self.enable_detailed_profiling,
             "cold_warmup_timeout_s": self.cold_warmup_timeout_s,
             "fresh_validation_timeout_s": self.fresh_validation_timeout_s,
+            "perception_worker_init_timeout_s": self.perception_worker_init_timeout_s,
+            "perception_worker_start_method": "spawn",
+            "perception_worker_hard_timeout_s": self._perception_worker_hard_timeout_s,
+            "perception_failure_timeout_s": self.state_manager.perception_timeout_s,
             "fc_backend": self._fc_backend,
             "fc_mavros_ns": self._mavros_ns,
             "localization_mode": self.localization_mode,
@@ -3814,7 +4198,11 @@ class OrinLandingPipeline:
         fastlio_pose = np.pad(
             fastlio_pose, (0, max(0, 3 - fastlio_pose.size)), constant_values=np.nan
         )
-        height_pose = enu if self._px4_pose_authoritative else fastlio_pose[:3]
+        height_pose = (
+            enu
+            if getattr(self, "_px4_pose_authoritative", False)
+            else fastlio_pose[:3]
+        )
         height_m = self.state_manager.height_from_pose(tuple(height_pose))
         self._event_log_writer.writerow([
             event,
@@ -3833,6 +4221,18 @@ class OrinLandingPipeline:
         self._recorded_mission_events.add(event)
         logger.info("[MissionEvent] %s state=%s reason=%s", event, self.mission_state, reason)
         return True
+
+    def _record_fatal_error(self, error: Exception, traceback_text: str) -> None:
+        """Persist an exception and its traceback before flight logs close."""
+        traceback_csv = str(traceback_text).replace("\n", "\\n")
+        self._shutdown_reason = f"fatal_error:{type(error).__name__}:{error}"
+        self._log_mission_event(
+            "FATAL_ERROR",
+            reason=(
+                f"type={type(error).__name__};message={error};"
+                f"traceback={traceback_csv}"
+            ),
+        )
 
     def _log_frame_timing(
         self, *, cloud_stamp_ros_s, cloud_seq, pose_seq, state, sync_ms,
@@ -3881,9 +4281,7 @@ class OrinLandingPipeline:
                     row.append("" if value is None else str(value))
                 else:
                     row.append(self._csv_float(value, 3))
-        self._frame_timing_writer.writerow(row)
-        if int(cloud_seq) % 10 == 0:
-            self._frame_timing_file.flush()
+        self._enqueue_diagnostic_row("frame_timing", row, critical=not accepted)
 
     def _log_profile_failure(self, profile: dict, stage: str, error: Exception) -> None:
         """Persist the partial frame profile before propagating flight fallback."""
@@ -3938,7 +4336,7 @@ class OrinLandingPipeline:
             getattr(self.fastlio, "pose", np.full(6, np.nan)), dtype=np.float64
         ).ravel()
         fastlio = np.pad(fastlio, (0, max(0, 6 - fastlio.size)), constant_values=np.nan)
-        self._perception_gate_writer.writerow([
+        row = [
             self._csv_float(self._ros_time_now_s(), 6),
             self._csv_float(self.fastlio.points_stamp, 6),
             int(cloud_seq), int(pose_seq), self._csv_float(sync_ms, 3),
@@ -3950,11 +4348,86 @@ class OrinLandingPipeline:
             *(self._csv_float(v, 2) for v in np.degrees(fastlio[3:6])),
             stage, "1" if accepted else "0", reason,
             "fastlio_deskewed_body" if self._use_body_cloud else "fastlio_world",
-        ])
-        if int(cloud_seq) % 10 == 0:
-            self._perception_gate_file.flush()
+        ]
+        self._enqueue_diagnostic_row("perception_gate", row)
+
+    def _start_diagnostic_log_writer(self) -> None:
+        if self._diagnostic_log_running:
+            return
+        self._diagnostic_log_queue = queue.Queue(maxsize=256)
+        self._diagnostic_log_running = True
+        self._diagnostic_log_thread = threading.Thread(
+            target=self._diagnostic_log_loop,
+            name="orin-diagnostic-log-writer",
+            daemon=True,
+        )
+        self._diagnostic_log_thread.start()
+
+    def _enqueue_diagnostic_row(self, kind: str, row, critical: bool = False) -> None:
+        q = getattr(self, "_diagnostic_log_queue", None)
+        if q is None:
+            # Focused logger tests construct the pipeline without _setup_run_dir.
+            writer = (
+                self._frame_timing_writer
+                if kind == "frame_timing" else self._perception_gate_writer
+            )
+            file_obj = (
+                self._frame_timing_file
+                if kind == "frame_timing" else self._perception_gate_file
+            )
+            writer.writerow(row)
+            file_obj.flush()
+            return
+        try:
+            if critical:
+                q.put((kind, row), timeout=0.1)
+            else:
+                q.put_nowait((kind, row))
+        except queue.Full:
+            self._diagnostic_log_dropped += 1
+            if self._diagnostic_log_dropped == 1 or self._diagnostic_log_dropped % 100 == 0:
+                logger.warning(
+                    "[DiagnosticLog] Queue full; dropped=%d",
+                    self._diagnostic_log_dropped,
+                )
+
+    def _diagnostic_log_loop(self) -> None:
+        while self._diagnostic_log_running or not self._diagnostic_log_queue.empty():
+            try:
+                item = self._diagnostic_log_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                continue
+            kind, row = item
+            try:
+                if kind == "frame_timing":
+                    self._frame_timing_writer.writerow(row)
+                    self._frame_timing_file.flush()
+                else:
+                    self._perception_gate_writer.writerow(row)
+                    self._perception_gate_file.flush()
+            except Exception as exc:
+                logger.warning("[DiagnosticLog] %s write failed: %s", kind, exc)
+
+    def _stop_diagnostic_log_writer(self) -> None:
+        if not getattr(self, "_diagnostic_log_running", False):
+            return
+        self._diagnostic_log_running = False
+        q = self._diagnostic_log_queue
+        if q is not None:
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+        thread = self._diagnostic_log_thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._diagnostic_log_thread = None
+        self._diagnostic_log_queue = None
 
     def _close_experiment_logs(self) -> None:
+        self._stop_diagnostic_log_writer()
         for kind in ("event_log", "frame_timing", "perception_gate"):
             file_obj = getattr(self, f"_{kind}_file", None)
             if file_obj is not None:
@@ -4147,7 +4620,20 @@ def main():
                 sys.exit(2)
         if not pipeline.init_ros_node():
             sys.exit(1)
-        asyncio.run(pipeline.run())
+        try:
+            asyncio.run(pipeline.run())
+        except KeyboardInterrupt:
+            pipeline._shutdown_reason = "keyboard_interrupt"
+            pipeline._log_mission_event("INTERRUPTED", reason="KeyboardInterrupt")
+            asyncio.run(pipeline._shutdown())
+        except Exception as exc:
+            import traceback
+            pipeline._record_fatal_error(exc, traceback.format_exc())
+            try:
+                asyncio.run(pipeline._shutdown())
+            except Exception as shutdown_exc:
+                logger.error("[Pipeline] Cleanup after fatal error failed: %s", shutdown_exc)
+            raise
     else:
         logger.info("[Replay] Not implemented. Use test_live_nocontrol.py for no-control ROS testing.")
 

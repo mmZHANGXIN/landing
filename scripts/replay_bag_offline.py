@@ -5,7 +5,7 @@ Orin Landing — 离线 rosbag 回放感知 + DRL 推理管线
 ====================================================
 与 pipeline.py 高度一致的感知决策管线，从 rosbag 读取 FAST-LIO 去畸变点云和位姿，
 跑完整的 HALSS 贝叶斯语义 + training-camera 深度投影 + NN-fill + ONNX PPO 推理，
-实时 OpenCV 可视化并打印每帧动作。
+实时 OpenCV 可视化 + Matplotlib 3D 去畸变点云窗口，并打印每帧动作。
 
 支持:
   - 室内 world-cloud 模式: /ali_cloud + /ali_odom
@@ -13,10 +13,7 @@ Orin Landing — 离线 rosbag 回放感知 + DRL 推理管线
 
 用法:
   source /opt/ros/noetic/setup.bash
-  python scripts/replay_bag_offline.py \\
-      --bag experiments/runs/20260721_175625_orin_landing/input.bag \\
-      --config ./config/experiment_outdoor_gps.yaml \\
-      --onnx-model weights/ppo2_policy.onnx
+  python scripts/replay_bag_offline.py --bag experiments/runs/20260807_162946_orin_landing/input.bag --config experiments/runs/20260807_162946_orin_landing/experiment_config_snapshot.yaml --onnx-model weights/ppo2_policy.onnx
 """
 
 from __future__ import annotations
@@ -85,6 +82,13 @@ def _stamp_to_sec(stamp) -> float:
 # ──────────────────────────────────────────────
 def _load_config(path: str) -> dict:
     config_path = Path(path).resolve()
+    if not config_path.is_file() and config_path.parent.name != "runs":
+        # Orin 上实验数据在 experiments/runs/<name>/, 开发机在 experiments/<name>/
+        # 传入路径不存在时自动尝试 runs/ 变体, 两种机器布局均直接可运行
+        alt = (config_path.parents[1] / "runs" / config_path.parent.name / config_path.name)
+        if alt.is_file():
+            logger.warning("[Config] %s 不存在, 改用 %s", config_path, alt)
+            config_path = alt
     import yaml
     with open(config_path, "r", encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
@@ -215,6 +219,72 @@ def render_sparse_depth(sparse_depth, valid_mask, dmax, min_valid=5, median_ksiz
     return np.clip(rendered, 0.0, dmax).astype(np.float32)
 
 
+def render_depth_fixed_gray(depth_m, vmax_m=30.0):
+    """主深度图固定量程显示: 0 m→黑, vmax m→白 (纯显示, 不改输入).
+
+    固定映射 norm = clip(depth / vmax, 0, 1): 相同距离跨帧始终得到相同灰度,
+    30 m 填充值恒为纯白, 量程不随帧变化, 承担绝对距离判断。
+    """
+    depth = np.nan_to_num(
+        np.asarray(depth_m, dtype=np.float32),
+        nan=vmax_m, posinf=vmax_m, neginf=0.0,
+    )
+    norm = np.clip(depth / max(float(vmax_m), 1e-6), 0.0, 1.0)
+    return cv2.cvtColor(np.round(norm * 255.0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+
+def render_depth_local_contrast(
+    depth_m, semantic_valid_mask,
+    vmax_m=30.0,
+    pct_low=2.0, pct_high=98.0, pad_frac=0.05,
+    min_span_m=0.5, min_valid=32,
+):
+    """局部深度对比度窗口: 逐帧自动量程, 近黑远白 (纯显示, 不改输入).
+
+    有效统计区域 = semantic_valid_mask & (0 < depth < vmax), 排除外围 unknown
+    和 NN-fill 填充的 dmax 格。量程取有效深度 pct_low/pct_high 百分位并外扩
+    pad_frac (默认 5%), 跨度不足 min_span_m 时围绕中值扩展, 有效像素不足
+    min_valid 时回退固定 [0, vmax_m] 量程。映射: near→0(黑), far→255(白),
+    不做边缘检测, 不叠加彩色轮廓。输出 BGR uint8。
+
+    Returns: (bgr_image, info) — info: auto_range/near_m/far_m/n_valid
+    """
+    depth = np.nan_to_num(
+        np.asarray(depth_m, dtype=np.float32),
+        nan=vmax_m, posinf=vmax_m, neginf=0.0,
+    )
+    mask = np.asarray(semantic_valid_mask, dtype=bool)
+    if mask.shape != depth.shape:
+        mask = cv2.resize(mask.astype(np.uint8),
+                          (depth.shape[1], depth.shape[0]),
+                          interpolation=cv2.INTER_NEAREST).astype(bool)
+    stat_mask = mask & np.isfinite(depth) & (depth > 0.0) & (depth < vmax_m)
+    n_valid = int(np.count_nonzero(stat_mask))
+    if n_valid >= min_valid:
+        low, high = np.percentile(depth[stat_mask], [pct_low, pct_high])
+        pad = (float(high) - float(low)) * pad_frac
+        near_used = float(low) - pad
+        far_used = float(high) + pad
+        if far_used - near_used < min_span_m:
+            mid = 0.5 * (float(low) + float(high))
+            near_used = mid - 0.5 * min_span_m
+            far_used = mid + 0.5 * min_span_m
+        auto_range = True
+    else:
+        near_used, far_used = 0.0, float(vmax_m)
+        auto_range = False
+    norm = np.clip((depth - near_used) / max(far_used - near_used, 1e-6), 0.0, 1.0)
+    bgr = cv2.cvtColor(np.round(norm * 255.0).astype(np.uint8), cv2.COLOR_GRAY2BGR)
+
+    info = {
+        "auto_range": auto_range,
+        "near_m": float(near_used),
+        "far_m": float(far_used),
+        "n_valid": n_valid,
+    }
+    return bgr, info
+
+
 # ──────────────────────────────────────────────
 # ONNX DRL (与 pipeline.py 完全一致)
 # ──────────────────────────────────────────────
@@ -297,32 +367,170 @@ class ONNXDRL:
 # OpenCV 可视化 (与 pipeline.py RealtimeVisualizer 完全对齐)
 # ──────────────────────────────────────────────
 class ReplayVisualizer:
-    """双窗口: 二值安全语义图 + 推断深度图 (inferno色表+色条)."""
+    """四窗口: 二值安全语义图 + 主深度图 (固定 0~30m 近黑远白) +
+    局部深度对比度窗口 (逐帧自动量程) + 3D 去畸变点云.
 
-    def __init__(self, dmax=30.0, depth_vmax_m=30.0, display_width=300):
+    主深度图固定量程承担绝对距离判断 (跨帧灰度恒定), 局部对比度窗口仅用于
+    观察当前帧细微深度变化, 均为纯灰度无彩色叠加. 3D 点云窗口使用 Matplotlib
+    (惰性导入, 优先 TkAgg), 显示每个成功处理帧实际送入 HALSS 的 halss_pts ——
+    已完成外参变换、roll/pitch leveling、ROI 过滤和高度方向转换,
+    level-body 坐标 x=forward / y=lateral / z=down. 点按 z 值着色 (inferno),
+    与语义图、深度图在同一次 update() 中同步刷新, 通过 draw_idle()/
+    flush_events() 保持窗口可旋转缩放且不阻塞回放.
+    """
+
+    def __init__(self, dmax=30.0, depth_vmax_m=30.0, display_width=300,
+                 depth_display_mode="fixed_gray", depth_near_m=0.5,
+                 depth_display_pct_low=2.0, depth_display_pct_high=98.0,
+                 depth_display_min_span_m=0.5, depth_display_min_valid=32,
+                 show_pointcloud=True, show_local_depth=True):
         self.dmax = dmax
         self.depth_vmax_m = depth_vmax_m
+        mode = str(depth_display_mode).lower()
+        self.depth_display_mode = (
+            "fixed_gray" if mode == "fixed_gray" else "legacy_inferno")
+        self.depth_near_m = max(0.01, float(depth_near_m))
+        self.depth_display_pct_low = float(depth_display_pct_low)
+        self.depth_display_pct_high = float(depth_display_pct_high)
+        self.depth_display_min_span_m = float(depth_display_min_span_m)
+        self.depth_display_min_valid = int(depth_display_min_valid)
         self.display_width = int(display_width)
         self._windows_ready = False
+        # 局部深度对比度窗口 (逐帧自动量程) 开关, --no-local-depth 可关闭
+        self.show_local_depth = bool(show_local_depth)
         # 深度图显示高基于源图高宽比，不固定为正方形
         self._disp_h = 300
+        # Matplotlib 3D 点云 (惰性导入; --no-display 时不构造本类, 故不会导入)
+        self.show_pointcloud = bool(show_pointcloud)
+        self._mpl = None          # matplotlib.pyplot 模块
+        self._pc_fig = None       # 3D 点云 figure / axes / scatter
+        self._pc_ax = None
+        self._pc_scatter = None
+        if self.show_pointcloud:
+            try:
+                self._mpl = self._import_matplotlib()
+            except Exception as exc:
+                logger.warning(
+                    "[Vis] Matplotlib unavailable (%s); 3D point cloud window "
+                    "disabled, OpenCV windows continue.", exc)
+                self._mpl = None
+
+    def _import_matplotlib(self):
+        """惰性导入 matplotlib; 优先 TkAgg (与 test_live_nocontrol.py 一致),
+        失败时回退到默认后端 (MacOSX/Qt/Agg 等), 均失败则抛异常由调用方降级."""
+        try:
+            import matplotlib
+            matplotlib.use("TkAgg")
+            import matplotlib.pyplot as plt
+            import mpl_toolkits.mplot3d  # 注册 3d projection (版本不匹配时易缺)
+            return plt
+        except Exception as exc:
+            # 常见于 conda python 缺 tkinter: 回退默认后端后窗口不会弹出,
+            # 必须明确警告, 否则无窗口且无任何报错, 极难排查
+            logger.warning(
+                "[Vis] TkAgg 不可用 (%s), 回退默认后端 — 3D 窗口可能无法显示. "
+                "建议用系统 python3 (python3-tk / X11 转发).", exc)
+            try:
+                import matplotlib.pyplot as plt  # 默认后端
+                import mpl_toolkits.mplot3d
+                return plt
+            except Exception:
+                raise
+
+    def _init_pointcloud_window(self):
+        """创建 3D 点云窗口 (标题 4.Deskewed Point Cloud, level-body 坐标轴).
+
+        所有资源先在局部变量中创建成功, 再一次性挂载到实例属性, 避免
+        半初始化状态 (fig 已建但 ax 缺失时 update 会崩溃).
+        """
+        self._mpl.ion()
+        fig = self._mpl.figure(num="4.Deskewed Point Cloud", figsize=(6, 6))
+        ax = fig.add_subplot(111, projection="3d")
+        ax.set_xlabel("x forward (m)")
+        ax.set_ylabel("y lateral (m)")
+        ax.set_zlabel("z down (m)")
+        ax.set_title("0 pts")
+        fig.canvas.draw_idle()
+        fig.canvas.flush_events()
+        # 全部成功后才挂载
+        self._pc_fig, self._pc_ax = fig, ax
+
+    def _update_pointcloud(self, point_cloud, cloud_stamp):
+        """刷新 3D 点云: 全量显示 halss_pts (不下采样), 按 z 值着色.
+
+        空点云/None 时清空散点集合并保留窗口, 不影响语义/深度窗口.
+        只读输入数组, 不改写坐标.
+        """
+        if self._mpl is None:
+            return
+        if self._pc_fig is None:
+            try:
+                self._init_pointcloud_window()
+            except Exception as exc:
+                # 窗口初始化失败 (如 matplotlib/numpy 版本不匹配导致
+                # 3d projection 缺失): 禁用窗口降级, 不向上抛异常
+                logger.warning("[Vis] 3D window init failed (%s); "
+                               "point cloud window disabled.", exc)
+                self._mpl = None
+                return
+        if self._pc_ax is None:
+            return
+        # 移除上一帧散点 (空点云时仅清空内容)
+        if self._pc_scatter is not None:
+            self._pc_scatter.remove()
+            self._pc_scatter = None
+        n = 0
+        if point_cloud is not None:
+            pts = np.asarray(point_cloud, dtype=np.float32)
+            if pts.ndim == 2 and pts.shape[1] >= 3 and len(pts) > 0:
+                pts = pts[:, :3]
+                n = len(pts)
+                self._pc_scatter = self._pc_ax.scatter(
+                    pts[:, 0], pts[:, 1], pts[:, 2],
+                    c=pts[:, 2], cmap="inferno", s=1.0, depthshade=False,
+                )
+        title = f"{n} pts"
+        if cloud_stamp is not None:
+            title += f"  ·  t={float(cloud_stamp):.3f}s"
+        self._pc_ax.set_title(title)
+        try:
+            self._pc_fig.canvas.draw_idle()
+            self._pc_fig.canvas.flush_events()
+        except Exception as exc:
+            # 窗口被关闭 (X 按钮) 或 X11 连接断开 → Tk 应用已销毁:
+            # 禁用窗口降级, 避免每个回调都抛 TclError 刷屏
+            logger.warning("[Vis] Window closed or unavailable (%s); "
+                           "point cloud window disabled.", exc)
+            self._mpl = None
 
     def _init_windows(self):
         cv2.namedWindow("1.Binary Semantic Map", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("1.Binary Semantic Map", self.display_width, self._disp_h)
         cv2.moveWindow("1.Binary Semantic Map", 20, 50)
 
-        cv2.namedWindow("2.Depth Map", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("2.Depth Map", self.display_width, self._disp_h)
-        cv2.moveWindow("2.Depth Map", 20 + self.display_width + 10, 50)
+        cv2.namedWindow("2.Depth Map (0-30m)", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("2.Depth Map (0-30m)", self.display_width, self._disp_h)
+        cv2.moveWindow("2.Depth Map (0-30m)", 20 + self.display_width + 10, 50)
+
+        if self.show_local_depth:
+            cv2.namedWindow("3.Local Depth Contrast", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("3.Local Depth Contrast", self.display_width, self._disp_h)
+            cv2.moveWindow("3.Local Depth Contrast",
+                           20 + 2 * (self.display_width + 10), 50)
 
         self._windows_ready = True
 
-    def update(self, depth_map, sem_map, binary_semantic_vis):
-        """更新双窗口。语义图自适应裁剪填满窗口，深度图固定 inferno 色表+色条。
+    def update(self, depth_map, sem_map, binary_semantic_vis,
+               point_cloud=None, cloud_stamp=None, semantic_valid_mask=None):
+        """更新四窗口。语义图自适应裁剪填满窗口; 主深度图固定 0~30m 近黑远白
+        (跨帧灰度恒定), 局部深度对比度窗口逐帧自动量程, 均为纯灰度.
 
         DRL 输入始终是 128x128 完整图像（含外围 unknown 区域）。
         可视化只显示有效语义区域的裁剪放大视图。
+        point_cloud/cloud_stamp: 本帧实际送入 HALSS 的 halss_pts 及其 ROS 时间戳,
+        与语义图、深度图来自同一帧; 空点云或 None 时清空 3D 窗口内容.
+        semantic_valid_mask: 本帧有效感知区域掩码 (False=外围 unknown/填充),
+        供局部对比度窗口自动量程使用; None 时视为全图有效.
         """
         h, w = depth_map.shape[:2]
         disp_w = self.display_width
@@ -360,40 +568,115 @@ class ReplayVisualizer:
         sem_bgr = cv2.resize(sem_bgr, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
         cv2.imshow("1.Binary Semantic Map", sem_bgr)
 
-        # ---- 2. 深度图: 同样自适应裁剪后 inferno 色表 + 右侧色条 ----
-        depth_m = np.nan_to_num(
-            depth_map.astype(np.float32, copy=False),
-            nan=self.depth_vmax_m, posinf=self.depth_vmax_m, neginf=0.0,
-        )
-        depth_norm = np.clip(depth_m / self.depth_vmax_m, 0.0, 1.0)
-        depth_u8 = (depth_norm * 255.0).astype(np.uint8)
+        # ---- 2. 主深度图: fixed_gray (固定 0~vmax 近黑远白) 或 legacy_inferno ----
+        if self.depth_display_mode == "legacy_inferno":
+            depth_m = np.nan_to_num(
+                depth_map.astype(np.float32, copy=False),
+                nan=self.depth_vmax_m, posinf=self.depth_vmax_m, neginf=0.0,
+            )
+            depth_m = np.clip(depth_m, self.depth_near_m, self.depth_vmax_m)
+            depth_u8 = np.round(
+                np.clip(depth_m / max(self.depth_vmax_m, 1e-6), 0.0, 1.0) * 255.0
+            ).astype(np.uint8)
+            depth_img = cv2.applyColorMap(depth_u8, cv2.COLORMAP_INFERNO)
+        else:  # fixed_gray: 0m→黑, vmax m→白, 跨帧灰度恒定
+            depth_img = render_depth_fixed_gray(depth_map, vmax_m=self.depth_vmax_m)
 
         # 深度图也用同样的 bounding box 裁剪（与语义图空间对齐）
         if valid_mask.any():
-            depth_cropped = depth_u8[r_min:r_max + 1, c_min:c_max + 1]
-        else:
-            depth_cropped = depth_u8
+            depth_img = depth_img[r_min:r_max + 1, c_min:c_max + 1]
+        depth_resized = cv2.resize(depth_img, (disp_w, disp_h),
+                                   interpolation=cv2.INTER_NEAREST)
 
-        depth_resized = cv2.resize(depth_cropped, (disp_w, disp_h), interpolation=cv2.INTER_NEAREST)
-        colored = cv2.applyColorMap(depth_resized, cv2.COLORMAP_INFERNO)
-
+        # 主窗口右侧色条
         bar_w = 40
-        with_bar = np.zeros((disp_h, disp_w + bar_w + 10, 3), dtype=np.uint8)
-        with_bar[:, :disp_w] = colored
-        for row in range(disp_h):
-            val = 255 - int(row / max(disp_h - 1, 1) * 255)
-            with_bar[row, disp_w + 5:disp_w + bar_w + 5] = cv2.applyColorMap(
-                np.array([[val]], dtype=np.uint8), cv2.COLORMAP_INFERNO)[0, 0]
         bar_x = disp_w + 5
-        cv2.putText(with_bar, "0m", (bar_x - 5, disp_h - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(with_bar, f"{int(self.depth_vmax_m)}m", (bar_x - 5, 15),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.imshow("2.Depth Map", with_bar)
+        with_bar = np.zeros((disp_h, disp_w + bar_w + 10, 3), dtype=np.uint8)
+        with_bar[:, :disp_w] = depth_resized
+        if self.depth_display_mode == "legacy_inferno":
+            # legacy: inferno 色条 (底部黑 0m → 顶部亮 vmax m)
+            for row in range(disp_h):
+                val = 255 - int(row / max(disp_h - 1, 1) * 255)
+                with_bar[row, bar_x:bar_x + bar_w] = cv2.applyColorMap(
+                    np.array([[val]], dtype=np.uint8), cv2.COLORMAP_INFERNO)[0, 0]
+            cv2.putText(with_bar, "0m", (bar_x - 5, disp_h - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(with_bar, f"{int(self.depth_vmax_m)}m", (bar_x - 5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(with_bar, "0->far", (5, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        else:
+            # fixed_gray: 固定灰阶色条 (底部黑 0m → 顶部白 vmax m), 不随帧变化
+            for row in range(disp_h):
+                val = 255 - int(row / max(disp_h - 1, 1) * 255)
+                with_bar[row, bar_x:bar_x + bar_w] = (val, val, val)
+            cv2.putText(with_bar, "0m", (bar_x - 5, disp_h - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(with_bar, f"{int(self.depth_vmax_m)}m", (bar_x - 5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(with_bar, f"fixed 0-{int(self.depth_vmax_m)}m", (5, 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.imshow("2.Depth Map (0-30m)", with_bar)
+
+        # ---- 3. 局部深度对比度窗口: 逐帧自动量程, 纯灰度, 无彩色叠加 ----
+        if self.show_local_depth:
+            if semantic_valid_mask is None:
+                smask = np.ones(depth_map.shape[:2], dtype=bool)
+            else:
+                smask = np.asarray(semantic_valid_mask, dtype=bool)
+                if smask.shape != depth_map.shape[:2]:
+                    smask = cv2.resize(
+                        smask.astype(np.uint8),
+                        (depth_map.shape[1], depth_map.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+            local_img, local_info = render_depth_local_contrast(
+                depth_map, smask,
+                vmax_m=self.depth_vmax_m,
+                pct_low=self.depth_display_pct_low,
+                pct_high=self.depth_display_pct_high,
+                min_span_m=self.depth_display_min_span_m,
+                min_valid=self.depth_display_min_valid,
+            )
+            # 与主深度图同样的 bounding box 裁剪 (空间对齐)
+            if valid_mask.any():
+                local_img = local_img[r_min:r_max + 1, c_min:c_max + 1]
+            local_resized = cv2.resize(local_img, (disp_w, disp_h),
+                                       interpolation=cv2.INTER_NEAREST)
+            loc_with_bar = np.zeros((disp_h, disp_w + bar_w + 10, 3), dtype=np.uint8)
+            loc_with_bar[:, :disp_w] = local_resized
+            # 灰阶色条: 顶部白 (far) → 底部黑 (near), 标注当前帧实际量程
+            for row in range(disp_h):
+                val = 255 - int(row / max(disp_h - 1, 1) * 255)
+                loc_with_bar[row, bar_x:bar_x + bar_w] = (val, val, val)
+            cv2.putText(loc_with_bar, f"{local_info['far_m']:.1f}m", (bar_x - 5, 15),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(loc_with_bar, f"{local_info['near_m']:.2f}m",
+                        (bar_x - 5, disp_h - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(loc_with_bar,
+                        "auto range" if local_info["auto_range"] else "fixed range",
+                        (5, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.putText(loc_with_bar,
+                        f"{local_info['near_m']:.2f}~{local_info['far_m']:.1f} m",
+                        (5, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+            cv2.imshow("3.Local Depth Contrast", loc_with_bar)
 
         cv2.waitKey(1)
 
+        # ---- 4. 3D 去畸变点云 (halss_pts, z 值着色, 与上述窗口同帧同步) ----
+        if self.show_pointcloud:
+            self._update_pointcloud(point_cloud, cloud_stamp)
+
     def close(self):
+        if self._pc_fig is not None:
+            try:
+                self._mpl.close(self._pc_fig)
+            except Exception:
+                pass
+            self._pc_fig = None
+            self._pc_ax = None
+            self._pc_scatter = None
         cv2.destroyAllWindows()
 
 
@@ -417,7 +700,16 @@ def main():
     parser.add_argument("--max-frames", type=int, default=0,
                         help="最多处理 N 帧 (0=处理全部)")
     parser.add_argument("--no-display", action="store_true",
-                        help="关闭可视化窗口")
+                        help="关闭全部可视化窗口 (且不导入 Matplotlib)")
+    parser.add_argument("--no-pointcloud", action="store_true",
+                        help="仅关闭 Matplotlib 3D 点云窗口 (保留语义/深度窗口)")
+    parser.add_argument("--depth-display-mode", default=None,
+                        choices=["fixed_gray", "legacy_inferno"],
+                        help="主深度图显示模式: fixed_gray=固定 0~30m 近黑远白 "
+                             "(默认); legacy_inferno=旧版 inferno 色表 (对比用)")
+    parser.add_argument("--no-local-depth", action="store_true",
+                        help="关闭局部深度对比度窗口 (3.Local Depth Contrast), "
+                             "保留主深度图")
     parser.add_argument("--rate", type=float, default=0.0,
                         help="回放速率倍率 (0=尽可能快, 1=实时)")
     parser.add_argument("--world-cloud", action="store_true",
@@ -537,10 +829,29 @@ def main():
 
     # ── 可视化 ──
     vis_cfg = cfg.get("visualization", {})
+    show_pointcloud = (not args.no_pointcloud) and bool(
+        vis_cfg.get("show_pointcloud", True))
+    # 主深度图模式: CLI 显式参数 > 配置 (仅两种有效值) > 默认 fixed_gray
+    cfg_depth_mode = str(vis_cfg.get("depth_display_mode", "")).lower()
+    depth_display_mode = args.depth_display_mode
+    if depth_display_mode is None:
+        depth_display_mode = (
+            cfg_depth_mode if cfg_depth_mode in {"fixed_gray", "legacy_inferno"}
+            else "fixed_gray")
+    show_local_depth = (not args.no_local_depth) and bool(
+        vis_cfg.get("show_local_depth", True))
     display = None if args.no_display else ReplayVisualizer(
         dmax=depth_max,
         depth_vmax_m=float(vis_cfg.get("depth_vmax_m", depth_max)),
         display_width=int(vis_cfg.get("display_width", 300)),
+        depth_display_mode=depth_display_mode,
+        depth_near_m=float(vis_cfg.get("depth_near_m", 0.5)),
+        depth_display_pct_low=float(vis_cfg.get("depth_display_pct_low", 2.0)),
+        depth_display_pct_high=float(vis_cfg.get("depth_display_pct_high", 98.0)),
+        depth_display_min_span_m=float(vis_cfg.get("depth_display_min_span_m", 0.5)),
+        depth_display_min_valid=int(vis_cfg.get("depth_display_min_valid", 32)),
+        show_pointcloud=show_pointcloud,
+        show_local_depth=show_local_depth,
     )
 
     # ──────────────────────────────────────────
@@ -856,9 +1167,13 @@ def main():
                         rl_info["obs_raw_min"], rl_info["obs_raw_max"],
                     )
 
-                # ── 可视化 ──
+                # ── 可视化 (三窗口同一帧: 语义 / 深度 / 3D 去畸变点云) ──
                 if display is not None:
-                    display.update(rendered_depth, sem_map, binary_semantic_vis)
+                    display.update(
+                        rendered_depth, sem_map, binary_semantic_vis,
+                        point_cloud=halss_pts, cloud_stamp=cloud_stamp,
+                        semantic_valid_mask=semantic_valid_mask,
+                    )
 
                 # ── 速率控制 ──
                 if args.rate > 0:

@@ -191,7 +191,7 @@ roscore &
 sudo ip addr add 192.168.1.5/24 dev eth0
 
 source /opt/ros/noetic/setup.bash && source ~/livox_ws/devel/setup.bash
-roslaunch livox_ros_driver2 msg_MID360.launch rviz_enable:=false
+roslaunch livox_ros_driver2 msg_MID360.launch rviz_enable:=true
 
 # 终端 3: FAST-LIO
 source ~/fast_lio_ws/devel/setup.bash

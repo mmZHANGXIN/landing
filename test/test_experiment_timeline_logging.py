@@ -2,7 +2,9 @@
 """Unit tests for mission-event and per-cloud timing CSV records."""
 
 import csv
+import asyncio
 import io
+import queue
 from types import SimpleNamespace
 
 import numpy as np
@@ -139,3 +141,120 @@ def test_detailed_frame_timing_appends_profile_and_failure_fields():
     assert detail["action_name"] == "DESCEND"
     assert detail["stage_error"] == "onnx_inference"
     assert detail["error_message"] == "RuntimeError: test failure"
+
+
+def test_latest_only_submission_replaces_unstarted_frame():
+    pipeline = OrinLandingPipeline.__new__(OrinLandingPipeline)
+    pipeline._perception_request_queue = queue.Queue(maxsize=1)
+    pipeline._submit_perception_job({"cloud_seq": 10})
+    pipeline._submit_perception_job({"cloud_seq": 11})
+    assert pipeline._perception_request_queue.get_nowait()["cloud_seq"] == 11
+
+
+def test_perception_failure_captures_full_xyz_and_keeps_yaw_rate():
+    calls = []
+
+    class _FC:
+        uavPosENU = np.array([1.0, 2.0, 30.0], dtype=np.float32)
+
+        async def send_position_enu_yaw_rate(self, x, y, z, yaw_rate):
+            calls.append((x, y, z, yaw_rate))
+
+    pipeline = OrinLandingPipeline.__new__(OrinLandingPipeline)
+    pipeline.fc = _FC()
+    pipeline.yaw_rate_cmd = 5.0
+    pipeline._perception_failure_since = None
+    pipeline._perception_hold_enu_xyz = None
+    pipeline.state_manager = SimpleNamespace(perception_timeout_s=20.0)
+    asyncio.run(pipeline._hold_for_perception_failure("test", None))
+    pipeline.fc.uavPosENU[:] = [9.0, 9.0, 9.0]
+    asyncio.run(pipeline._hold_for_perception_failure("test", None))
+    assert calls == [(1.0, 2.0, 30.0, 5.0), (1.0, 2.0, 30.0, 5.0)]
+
+
+def test_async_frame_writer_flushes_before_shutdown():
+    pipeline = OrinLandingPipeline.__new__(OrinLandingPipeline)
+    output = _FlushableStringIO()
+    pipeline._frame_timing_file = output
+    pipeline._frame_timing_writer = csv.writer(output)
+    pipeline._perception_gate_file = _FlushableStringIO()
+    pipeline._perception_gate_writer = csv.writer(pipeline._perception_gate_file)
+    pipeline._diagnostic_log_running = False
+    pipeline._diagnostic_log_queue = None
+    pipeline._diagnostic_log_thread = None
+    pipeline._diagnostic_log_dropped = 0
+    pipeline._start_diagnostic_log_writer()
+    pipeline._enqueue_diagnostic_row("frame_timing", ["frame", "1"])
+    pipeline._stop_diagnostic_log_writer()
+    assert _csv_rows(output) == [["frame", "1"]]
+
+
+def test_mavros_safety_and_shutdown_reason_are_persisted():
+    async def _async_noop(*args, **kwargs):
+        return None
+
+    pipeline = OrinLandingPipeline.__new__(OrinLandingPipeline)
+    output = _FlushableStringIO()
+    pipeline._event_log_file = output
+    pipeline._event_log_writer = csv.writer(output)
+    pipeline._recorded_mission_events = set()
+    pipeline._rospy = None
+    pipeline._px4_pose_authoritative = True
+    pipeline._shutdown_reason = ""
+    pipeline._shutdown_event_logged = False
+    pipeline.mission_state = "GOTO_SAFE"
+    pipeline.fc = SimpleNamespace(
+        uavPosENU=np.array([1.0, 2.0, 30.0]),
+        isArmed=True,
+        isOffboard=False,
+        flightMode="POSCTL",
+        safety_fallback=True,
+        safety_fallback_reason="OFFBOARD_lost",
+        landed_state_on_ground=False,
+        send_velocity_enu_yaw_rate=_async_noop,
+    )
+    pipeline.fastlio = SimpleNamespace(pose=None)
+    pipeline.state_manager = SimpleNamespace(height_from_pose=lambda pose: pose[2])
+
+    assert asyncio.run(pipeline._check_active_flight_safety("GOTO_SAFE")) is False
+    assert pipeline.mission_state == "IDLE"
+    rows = _csv_rows(output)
+    assert rows[0][0] == "MAVROS_SAFETY_FALLBACK"
+    assert "phase=GOTO_SAFE" in rows[0][4]
+    assert "armed=True;offboard=False;mode=POSCTL" in rows[0][4]
+    assert rows[1][0] == "MANUAL_TAKEOVER"
+
+    pipeline._stop_perception_worker = lambda graceful=True: None
+    pipeline.visualizer = SimpleNamespace(close=lambda: None)
+    pipeline._stop_recording = _async_noop
+    pipeline._close_velocity_log = lambda: None
+    pipeline._close_drl_action_log = lambda: None
+    pipeline._close_experiment_logs = lambda: None
+    asyncio.run(pipeline._shutdown())
+    rows = _csv_rows(output)
+    assert rows[2][0] == "SHUTDOWN_REASON"
+    assert "mavros_safety_fallback" in rows[2][4]
+    assert "armed=True;offboard=False;mode=POSCTL" in rows[2][4]
+
+
+def test_fatal_error_event_contains_flattened_traceback():
+    pipeline = OrinLandingPipeline.__new__(OrinLandingPipeline)
+    output = _FlushableStringIO()
+    pipeline._event_log_file = output
+    pipeline._event_log_writer = csv.writer(output)
+    pipeline._recorded_mission_events = set()
+    pipeline._rospy = None
+    pipeline._px4_pose_authoritative = True
+    pipeline.mission_state = "DRL_DESCENT"
+    pipeline.fc = SimpleNamespace(
+        uavPosENU=np.zeros(3), isArmed=True, isOffboard=True,
+        landed_state_on_ground=False,
+    )
+    pipeline.fastlio = SimpleNamespace(pose=None)
+    pipeline.state_manager = SimpleNamespace(height_from_pose=lambda pose: pose[2])
+
+    pipeline._record_fatal_error(RuntimeError("boom"), "line one\nline two\n")
+    row = _csv_rows(output)[0]
+    assert row[0] == "FATAL_ERROR"
+    assert "type=RuntimeError;message=boom" in row[4]
+    assert "traceback=line one\\nline two\\n" in row[4]

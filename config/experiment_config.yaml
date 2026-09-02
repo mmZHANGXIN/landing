@@ -12,10 +12,12 @@ runtime:
   enable_detailed_profiling: true  # 逐帧细分耗时/质量/异常字段；false时保持旧frame_timing表头
   cold_warmup_timeout_s: 15        # CUDA/HALSS/ONNX 冷启动阶段独立超时
   fresh_validation_timeout_s: 10   # 冷启动完成后等待一帧新鲜有效数据的独立超时
+  perception_worker_init_timeout_s: 60.0 # 解锁前允许子进程加载HALSS/ONNX及创建CUDA session
   max_inference_result_age_ms: 500 # 点云header年龄+计算耗时小于此值即可执行，不要求绝对最新帧
+  perception_worker_hard_timeout_s: 1.0 # native HALSS/CUDA调用超过此时间则终止并重启隔离进程
   max_cloud_odom_sync_ms: 100      # FAST-LIO 点云/位姿 header 最大允许时间差
   drop_stale_frames: true          # 只丢弃超过 max_inference_result_age_ms 的结果
-  drop_slow_frames: true           # 超龄结果不执行，改用 PX4 ENU 固定 XY 闭环保持
+  drop_slow_frames: true           # 超龄结果不执行，改用 PX4 ENU 固定 XYZ + 配置偏航率保持
   device: "cuda"                   # "cuda" | "cpu" (cpu 仅离线调试)
 
 # ---- 实验录制 (最小 rosbag + 复现记录) ----
@@ -77,8 +79,7 @@ mission_state:
   direct_land_vz_mps: 0.25
   direct_land_lock_xy_yaw: true
   direct_land_continue_yaw_rate: true
-  perception_timeout_s: 0.5
-  timeout_direct_land_max_height_m: 0.8
+  perception_timeout_s: 20.0       # 连续无有效正式帧达到此时长后请求人工接管
   pose_timeout_s: 0.2
   ground_crosscheck_enabled: true  # 点云地面距离只做交叉校验, 不作为默认高度源
   ground_crosscheck_action: "warn" # "warn" | "block"
@@ -92,6 +93,7 @@ localization:
   world_cloud_topic: "/ali_cloud"
   body_cloud_topic: "/cloud_registered_body"
   fastlio_pose_required: true       # outdoor frontend-only profile overrides false
+  require_gps_before_arm: false     # 准备阶段不以 GPS fix/精度阻止解锁；固定GPS航点在起飞交接后再验证
   max_gps_age_s: 2.0
   max_gps_horizontal_accuracy_m: 5.0
   external_pose_topic: "/mavros/vision_pose/pose" # 室内发布、室外禁止发布，由 FAST-LIO launch 参数控制
@@ -174,7 +176,8 @@ decision:
   backend: "onnx"
   onnx_model_path: "weights/ppo2_policy.onnx"
   onnx_meta_path: "weights/ppo2_policy_meta.json"
-  require_gpu: true                 # 真机禁止策略推理静默回退 CPU
+  require_gpu: true                 # 优先使用TensorRT/CUDA execution provider
+  allow_cpu_fallback_if_no_gpu_ep: true # Jetson当前ORT无GPU EP时显式允许CPU；仍受500ms结果年龄门控
 
 # ---- 全局安全先验 (离线 GIS 预处理结果) ----
 global_prior:
@@ -203,6 +206,9 @@ visualization:
   display_width: 300
   display_height: 300
   depth_vmax_m: 30.0               # 深度相机式渲染固定色标上限
+  depth_display_mode: disparity    # disparity=近处高亮；metric=原始线性色标
+  depth_near_m: 0.5                # 仅用于显示，不改变策略输入
+  depth_disparity_gamma: 4.0       # 增强 25~30m 高空段的近障碍对比度
   binary_semantic_window_title: "binary semantic"
   save_frames: false
   save_raw_arrays: false           # 旧离线调试开关，当前主管线不使用

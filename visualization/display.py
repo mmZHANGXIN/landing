@@ -19,6 +19,12 @@ class RealtimeVisualizer:
         self.save_frames = cfg.get("save_frames", False)
         self.save_dir = cfg.get("save_dir", "./experiments/frames")
         self.depth_vmax_m = float(cfg.get("depth_vmax_m", 30.0))
+        # A metric 0..30 m colour map is hard to read during the high-altitude
+        # part of a landing.  ``disparity`` keeps the policy input untouched,
+        # but makes nearby returns bright like a depth camera display.
+        self.depth_display_mode = str(cfg.get("depth_display_mode", "disparity")).lower()
+        self.depth_near_m = max(0.01, float(cfg.get("depth_near_m", 0.5)))
+        self.depth_disparity_gamma = max(1.0, float(cfg.get("depth_disparity_gamma", 4.0)))
         self._windows_ready = False
 
         self._safe_class_id = 1
@@ -86,13 +92,31 @@ class RealtimeVisualizer:
         return cv2.resize(vis_bgr, (self.disp_w, self.disp_h), interpolation=cv2.INTER_NEAREST)
 
     def _render_depth(self, depth_map: np.ndarray) -> np.ndarray:
-        """深度图 → inferno 色表 + 右侧色条 (对齐 test_live_nocontrol.py 深度相机风格)."""
+        """深度图 → depth-camera style disparity image + scale bar.
+
+        The input remains metric depth.  Only this display path uses the
+        inverse/nonlinear mapping, so changing visual contrast cannot change
+        the ONNX observation.
+        """
         depth_m = np.nan_to_num(
             depth_map.astype(np.float32, copy=False),
             nan=self.depth_vmax_m, posinf=self.depth_vmax_m, neginf=0.0,
         )
-        depth_norm = np.clip(depth_m / self.depth_vmax_m, 0.0, 1.0)
-        depth_u8 = (depth_norm * 255.0).astype(np.uint8)
+        depth_m = np.clip(depth_m, self.depth_near_m, self.depth_vmax_m)
+        if self.depth_display_mode in {"disparity", "camera", "depth_camera"}:
+            # gamma > 1 expands contrast close to the far clipping plane:
+            # at 30 m, 25 m is visibly different from 28 m.
+            distance_norm = np.clip(
+                (depth_m - self.depth_near_m)
+                / max(self.depth_vmax_m - self.depth_near_m, 1e-6),
+                0.0, 1.0,
+            )
+            depth_norm = 1.0 - np.power(distance_norm, self.depth_disparity_gamma)
+            scale_label = "near->far"
+        else:
+            depth_norm = np.clip(depth_m / self.depth_vmax_m, 0.0, 1.0)
+            scale_label = "0\u2192far"
+        depth_u8 = np.round(depth_norm * 255.0).astype(np.uint8)
         depth_resized = cv2.resize(depth_u8, (self.disp_w, self.disp_h), interpolation=cv2.INTER_NEAREST)
         colored = cv2.applyColorMap(depth_resized, cv2.COLORMAP_INFERNO)
 
@@ -103,14 +127,17 @@ class RealtimeVisualizer:
         with_bar[:, :self.disp_w] = colored
         # 画色条
         for row in range(h):
-            val = 255 - int(row / max(h - 1, 1) * 255)  # 上=浅(近), 下=深(远)
+            val = 255 - int(row / max(h - 1, 1) * 255)  # 上=近, 下=远
             with_bar[row, self.disp_w + 5:self.disp_w + bar_w + 5] = cv2.applyColorMap(
                 np.array([[val]], dtype=np.uint8), cv2.COLORMAP_INFERNO)[0, 0]
         # 色条标注
         bar_x = self.disp_w + 5
-        cv2.putText(with_bar, "0m", (bar_x - 5, h - 5),
+        near_label = f"{self.depth_near_m:g}m" if self.depth_display_mode in {"disparity", "camera", "depth_camera"} else "0m"
+        cv2.putText(with_bar, near_label, (bar_x - 5, 15 if near_label != "0m" else h - 5),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(with_bar, f"{int(self.depth_vmax_m)}m", (bar_x - 5, 15),
+        cv2.putText(with_bar, f"{int(self.depth_vmax_m)}m", (bar_x - 5, h - 5 if near_label != "0m" else 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+        cv2.putText(with_bar, scale_label, (5, 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         return with_bar
 

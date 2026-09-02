@@ -107,9 +107,6 @@ class MissionStateManager:
         self.direct_land_lock_xy_yaw = bool(cfg.get("direct_land_lock_xy_yaw", True))
         self.direct_land_continue_yaw_rate = bool(cfg.get("direct_land_continue_yaw_rate", True))
         self.perception_timeout_s = float(cfg.get("perception_timeout_s", 1.5))
-        self.timeout_direct_land_max_height_m = float(
-            cfg.get("timeout_direct_land_max_height_m", self.direct_land_trigger_height_m)
-        )
         self.pose_timeout_s = float(cfg.get("pose_timeout_s", 0.2))
         self.max_cloud_odom_sync_ms = float(cfg.get("max_cloud_odom_sync_ms", 100.0))
         self.ground_crosscheck_enabled = bool(cfg.get("ground_crosscheck_enabled", True))
@@ -254,6 +251,12 @@ class MissionStateManager:
                 self.state = MissionState.DIRECT_LAND
                 reason = direct_reason
                 self._capture_land_reference(inputs)
+            elif (
+                inputs.perception_age_s is not None
+                and inputs.perception_age_s >= self.perception_timeout_s
+            ):
+                self.state = MissionState.HOLD_FOR_MANUAL
+                reason = "perception_timeout_manual_takeover"
         elif self.state == MissionState.DIRECT_LAND:
             if self._land_reference_xy_yaw is None:
                 self._capture_land_reference(inputs)
@@ -298,16 +301,6 @@ class MissionStateManager:
             if self._ground_crosscheck_warns(height_m, ground_p05):
                 return "height_below_direct_land_trigger_crosscheck_warn"
             return "height_below_direct_land_trigger"
-        perception_stale = (
-            inputs.perception_age_s is not None
-            and inputs.perception_age_s > self.perception_timeout_s
-        ) or not inputs.perception_ok
-        if (
-            perception_stale
-            and height_m is not None
-            and height_m <= self.timeout_direct_land_max_height_m
-        ):
-            return "perception_timeout_low_height"
         return None
 
     def _ground_crosscheck_blocks(self, height_m: float, ground_p05: Optional[float]) -> bool:

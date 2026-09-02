@@ -92,12 +92,53 @@ def test_pose_timeout_aborts_in_descent():
     assert decision.abort
 
 
+def test_perception_timeout_requests_manual_takeover_only_at_20s():
+    mgr = MissionStateManager({
+        "height_axis": "pos_z",
+        "ground_z_ref_m": 0.0,
+        "direct_land_trigger_height_m": 0.5,
+        "perception_timeout_s": 20.0,
+    })
+    mgr.start_after_takeoff(False)
+    before = StateInputs(
+        now=19.9, pose_xyz=(0.0, 0.0, 30.0), perception_age_s=19.9,
+        perception_ok=False, offboard_active=True, armed=True,
+    )
+    assert mgr.update(before).state == MissionState.DRL_DESCENT
+    at_timeout = StateInputs(
+        now=20.0, pose_xyz=(0.0, 0.0, 30.0), perception_age_s=20.0,
+        perception_ok=False, offboard_active=True, armed=True,
+    )
+    decision = mgr.update(at_timeout)
+    assert decision.state == MissionState.HOLD_FOR_MANUAL
+    assert decision.reason == "perception_timeout_manual_takeover"
+
+
+def test_low_height_direct_land_precedes_perception_timeout():
+    mgr = MissionStateManager({
+        "height_axis": "pos_z",
+        "ground_z_ref_m": 0.0,
+        "direct_land_trigger_height_m": 0.5,
+        "perception_timeout_s": 20.0,
+        "ground_crosscheck_enabled": False,
+    })
+    mgr.start_after_takeoff(False)
+    decision = mgr.update(StateInputs(
+        now=20.0, pose_xyz=(0.0, 0.0, 0.4), perception_age_s=20.0,
+        perception_ok=False, offboard_active=True, armed=True,
+    ))
+    assert decision.state == MissionState.DIRECT_LAND
+    assert decision.reason == "height_below_direct_land_trigger"
+
+
 def main():
     test_fastlio_z_triggers_direct_land()
     test_ground_crosscheck_warn_does_not_block()
     test_ground_crosscheck_block_can_block()
     test_pointcloud_low_without_low_pose_does_not_trigger()
     test_pose_timeout_aborts_in_descent()
+    test_perception_timeout_requests_manual_takeover_only_at_20s()
+    test_low_height_direct_land_precedes_perception_timeout()
     print("=== Mission state manager light tests ===")
     print("  OK fastlio z triggers direct land")
     print("  OK ground crosscheck warn/block behavior")

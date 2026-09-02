@@ -20,6 +20,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from utils.valid_nearest import fill_valid_nearest
+
 
 @dataclass(frozen=True)
 class TrainingCameraModel:
@@ -155,11 +157,13 @@ def sample_nearest_points_by_camera_rays(points_body: np.ndarray,
 
 
 def _sample_bev_labels(points_body: np.ndarray, semantic_bev: np.ndarray,
-                       bounds: dict, danger_id: int) -> np.ndarray:
-    """Nearest-neighbour sample HALSS labels at each body-frame point."""
+                       bounds: dict, danger_id: int,
+                       semantic_bev_valid: np.ndarray | None = None):
+    """Nearest-neighbour sample labels and geometric validity at each point."""
     labels = np.full(len(points_body), int(danger_id), dtype=np.uint8)
+    label_valid = np.zeros(len(points_body), dtype=bool)
     if semantic_bev is None or np.asarray(semantic_bev).size == 0:
-        return labels
+        return labels, label_valid
 
     sem = np.asarray(semantic_bev)
     h, w = sem.shape[:2]
@@ -177,17 +181,33 @@ def _sample_bev_labels(points_body: np.ndarray, semantic_bev: np.ndarray,
     row = (h - 1) - row_unflipped
     inside = (row >= 0) & (row < h) & (col >= 0) & (col < w)
     labels[inside] = sem[row[inside], col[inside]].astype(np.uint8)
-    return labels
+    if semantic_bev_valid is None:
+        label_valid[inside] = True
+    else:
+        bev_valid = np.asarray(semantic_bev_valid, dtype=bool)
+        if bev_valid.shape != sem.shape[:2]:
+            raise ValueError("semantic_bev_valid must match semantic_bev shape")
+        label_valid[inside] = bev_valid[row[inside], col[inside]]
+    return labels, label_valid
 
 
 def project_training_camera(points_body: np.ndarray, semantic_bev: np.ndarray,
                             bev_bounds: dict, camera: TrainingCameraModel,
-                            danger_id: int = 9):
+                            danger_id: int = 9, fill_unobserved: bool = True,
+                            semantic_bev_valid: np.ndarray | None = None,
+                            semantic_fill_radius_px: float = 0.0):
     """Project depth and matching HALSS labels with one shared z-buffer.
 
     Returns sparse_depth, depth_valid_mask, semantic_map,
     semantic_valid_mask. Unknown semantic pixels are conservatively encoded as
     ``danger_id``; ``semantic_valid_mask`` keeps unknown distinct for diagnostics.
+
+    ``fill_unobserved=True`` (default) keeps the historical behaviour: semantic
+    labels are NN-filled inside the projected convex hull of observed pixels.
+    ``fill_unobserved=False`` keeps conservative behaviour. If
+    ``semantic_fill_radius_px > 0``, only small holes inside the semantic seed
+    convex hull and within that distance of a geometrically supported seed are
+    reconstructed; larger unobserved gaps remain unknown.
     """
     h, w = camera.output_height, camera.output_width
     depth = np.full((h, w), camera.far_m, dtype=np.float32)
@@ -207,14 +227,18 @@ def project_training_camera(points_body: np.ndarray, semantic_bev: np.ndarray,
     if len(pts) == 0:
         return depth, valid_mask, semantic, valid_mask.copy()
 
-    point_labels = _sample_bev_labels(pts, semantic_bev, bev_bounds, danger_id)
+    point_labels, point_label_valid = _sample_bev_labels(
+        pts, semantic_bev, bev_bounds, danger_id,
+        semantic_bev_valid=semantic_bev_valid)
     z = pts[:, 2]
     x_camera = -pts[:, 1]
     y_camera = -pts[:, 0]
     u = np.floor(camera.fx * x_camera / z + camera.cx).astype(np.int32)
     v = np.floor(camera.fy * y_camera / z + camera.cy).astype(np.int32)
     inside = (u >= 0) & (u < w) & (v >= 0) & (v < h)
-    u, v, z, point_labels = u[inside], v[inside], z[inside], point_labels[inside]
+    u, v, z = u[inside], v[inside], z[inside]
+    point_labels = point_labels[inside]
+    point_label_valid = point_label_valid[inside]
     if len(z) == 0:
         return depth, valid_mask, semantic, valid_mask.copy()
 
@@ -231,27 +255,43 @@ def project_training_camera(points_body: np.ndarray, semantic_bev: np.ndarray,
     chosen_flat = flat[chosen]
     semantic.ravel()[chosen_flat] = point_labels[chosen]
     valid_mask.ravel()[chosen_flat] = True
+    # 深度有效不等于语义有效。局部平面支持不足的点仍贡献深度，
+    # 但不能被默认解释成安全或危险语义。
+    semantic_seed = np.zeros((h, w), dtype=bool)
+    semantic_seed.ravel()[chosen_flat] = point_label_valid[chosen]
 
-    # HALSS is a surface classifier. Fill only the observed projected convex hull;
-    # pixels outside remain explicitly unknown/danger instead of fake coverage.
-    semantic_valid = np.zeros((h, w), dtype=np.uint8)
-    coords = np.column_stack(np.where(valid_mask))[:, ::-1].astype(np.int32)
-    if len(coords) >= 3:
-        cv2.fillConvexPoly(semantic_valid, cv2.convexHull(coords), 1)
+    if fill_unobserved:
+        # HALSS is a surface classifier. Fill only the observed projected convex
+        # hull; pixels outside remain explicitly unknown/danger instead of fake
+        # coverage.
+        semantic_valid = np.zeros((h, w), dtype=np.uint8)
+        coords = np.column_stack(np.where(semantic_seed))[:, ::-1].astype(np.int32)
+        if len(coords) >= 3:
+            cv2.fillConvexPoly(semantic_valid, cv2.convexHull(coords), 1)
+        else:
+            semantic_valid[semantic_seed] = 1
+        semantic_valid = semantic_valid.astype(bool)
     else:
-        semantic_valid[valid_mask] = 1
-    semantic_valid = semantic_valid.astype(bool)
+        semantic_valid = semantic_seed.copy()
+        radius = max(float(semantic_fill_radius_px), 0.0)
+        if radius > 0.0 and semantic_seed.any():
+            hull = np.zeros((h, w), dtype=np.uint8)
+            coords = np.column_stack(np.where(semantic_seed))[:, ::-1].astype(np.int32)
+            if len(coords) >= 3:
+                cv2.fillConvexPoly(hull, cv2.convexHull(coords), 1)
+            else:
+                hull[semantic_seed] = 1
+            distance = cv2.distanceTransform(
+                (~semantic_seed).astype(np.uint8), cv2.DIST_L2, 5)
+            semantic_valid = hull.astype(bool) & (distance <= radius)
 
-    if valid_mask.any() and np.any(semantic_valid & ~valid_mask):
-        invalid = ~valid_mask
+    if semantic_seed.any() and np.any(semantic_valid & ~semantic_seed):
         _, nearest_labels = cv2.distanceTransformWithLabels(
-            invalid.astype(np.uint8), cv2.DIST_L2, 5, cv2.DIST_LABEL_PIXEL
-        )
-        valid_coords = np.column_stack(np.where(valid_mask))
-        fill = semantic_valid & ~valid_mask
-        nearest_idx = np.clip(nearest_labels[fill] - 1, 0, len(valid_coords) - 1)
-        nearest = valid_coords[nearest_idx]
-        semantic[fill] = semantic[nearest[:, 0], nearest[:, 1]]
+            (~semantic_seed).astype(np.uint8), cv2.DIST_L2, 5,
+            cv2.DIST_LABEL_PIXEL)
+        filled_all = fill_valid_nearest(semantic, semantic_seed, nearest_labels)
+        fill = semantic_valid & ~semantic_seed
+        semantic[fill] = filled_all[fill]
 
     semantic[~semantic_valid] = np.uint8(danger_id)
     return depth, valid_mask, semantic, semantic_valid
