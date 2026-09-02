@@ -7,8 +7,8 @@ Orin Landing - 真机实时感知-决策-控制主管线
   GIS 九宫格全局安全区 → MAVROS/PX4 位置引导
   Mid360 → FAST-LIO frontend IMU 去畸变点云（室外不运行 SLAM 后端）
   去畸变点云 → Mid360 安装外参补偿 → PX4 重力对齐 → 固定针孔射线采样
-  点云 → HALSS Bayesian 二值安全语义图
-  点云 → 原训练下视相机几何稀疏深度 → NN-fill 渲染深度
+  点云 → 二值安全语义图
+  点云 → 原训练下视相机几何稀疏深度 → 渲染深度
   [rendered_depth, binary_semantic] → ONNX PPO → 离散动作
   离散动作 + 同帧 Fast-LIO yaw → NED 速度 + yaw setpoint → PX4
   python pipeline.py --config ./config/experiment_outdoor_gps.yaml --mode ros
